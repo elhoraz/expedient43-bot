@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "Expedient Generation 43 WhatsApp Bot 24/7 Cloud Gateway",
+  "main": "index.js",
   "scripts": {
-    "start": "tsx scripts/wa-gateway.ts"
+    "start": "node index.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
