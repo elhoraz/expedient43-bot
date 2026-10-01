@@ -1,4 +1,10 @@
 require("dotenv").config();
+try {
+  const WebSocket = require("ws");
+  if (!globalThis.WebSocket) globalThis.WebSocket = WebSocket;
+  if (typeof global !== "undefined" && !global.WebSocket) global.WebSocket = WebSocket;
+} catch (_) {}
+
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");

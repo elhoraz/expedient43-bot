@@ -4,6 +4,15 @@
  * Dilengkapi Web Dashboard Realtime, QR Scanner Web, Auto Pairing Code, dan Gemini Multimodal
  */
 
+import WebSocket from "ws";
+if (typeof globalThis.WebSocket === "undefined") {
+  // @ts-ignore
+  globalThis.WebSocket = WebSocket;
+}
+if (typeof global !== "undefined" && typeof (global as any).WebSocket === "undefined") {
+  (global as any).WebSocket = WebSocket;
+}
+
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
