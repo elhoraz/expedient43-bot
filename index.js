@@ -3,6 +3,13 @@ const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
+// Ensure whatsapp-rust-bridge exports are compatible before launching tsx
+try {
+  require("./scripts/patch-pkg.js");
+} catch (e) {
+  console.warn("Patch hook warning:", e.message);
+}
+
 console.log("=======================================================");
 console.log("🚀 EXPEDIENT 43 - WHATSAPP BOT RUNNER");
 console.log("📦 Node.js Version:", process.version);
