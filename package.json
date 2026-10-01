@@ -4,6 +4,9 @@
   "private": true,
   "description": "Expedient Generation 43 WhatsApp Bot 24/7 Cloud Gateway",
   "main": "index.js",
+  "engines": {
+    "node": "20.x"
+  },
   "scripts": {
     "start": "node index.js"
   },
