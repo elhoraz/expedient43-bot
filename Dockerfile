@@ -9,7 +9,7 @@ RUN npm install --omit=dev
 COPY scripts ./scripts
 COPY src ./src
 
-EXPOSE 7860
-ENV PORT=7860
+EXPOSE 8080
+ENV PORT=8080
 
 CMD ["node", "index.js"]

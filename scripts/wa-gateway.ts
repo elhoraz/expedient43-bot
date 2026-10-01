@@ -663,29 +663,16 @@ async function startBaileysGateway() {
     }
   });
 
-  // Simpan instance socket aktif secara global untuk health check
-  activeSock = sock;
-
-  return sock;
-}
-
-// HTTP Health Check Server (Singleton - hanya dijalankan sekali di awal)
-let activeSock: any = null;
-let healthServerStarted = false;
-
-function initHealthServer() {
-  if (healthServerStarted) return;
-  healthServerStarted = true;
-
-  const HTTP_PORT = parseInt(process.env.GATEWAY_PORT || process.env.PORT || "7860", 10);
+  // HTTP Health Check Server untuk Cloud Hosting (Back4App / Render / Koyeb)
+  const HTTP_PORT = parseInt(process.env.PORT || process.env.GATEWAY_PORT || "8080", 10);
   const healthServer = http.createServer((req, res) => {
-    if (req.url === "/health" || req.url === "/") {
+    if (req.url === "/health" || req.url === "/" || req.url === "/ping") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
           status: "online",
           bot: "Expedient 43 WhatsApp Gateway",
-          device: activeSock?.user?.id || "connected",
+          device: sock.user?.id || "connected",
           uptimeSeconds: Math.round(process.uptime()),
           timestamp: new Date().toISOString(),
         })
@@ -704,13 +691,12 @@ function initHealthServer() {
     }
   });
 
-  healthServer.listen(HTTP_PORT, () => {
-    console.log(`🌐 [CLOUD-KEEP-ALIVE] HTTP Health Server aktif di port ${HTTP_PORT} (Keep-Alive Ready)`);
+  healthServer.listen(HTTP_PORT, "0.0.0.0", () => {
+    console.log(`🌐 [CLOUD-KEEP-ALIVE] HTTP Health Server aktif di 0.0.0.0:${HTTP_PORT} (Back4App Ready)`);
   });
-}
 
-// Jalankan server health sekali
-initHealthServer();
+  return sock;
+}
 
 // Jalankan gateway
 startBaileysGateway().catch((err) => {
