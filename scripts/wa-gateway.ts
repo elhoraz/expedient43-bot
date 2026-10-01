@@ -1,7 +1,7 @@
 /**
  * scripts/wa-gateway.ts
  * Self-Hosted Baileys WhatsApp Gateway (100% GRATIS SELAMANYA)
- * Mendukung Teks, Gambar, Stiker (.webp), Voice Note (VN), dan Video Note dengan Gemini Multimodal
+ * Dilengkapi Web Dashboard Realtime, QR Scanner Web, Auto Pairing Code, dan Gemini Multimodal
  */
 
 import makeWASocket, {
@@ -18,7 +18,6 @@ import pino from "pino";
 // @ts-ignore
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
-import { exec } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import * as http from "http";
@@ -38,12 +37,9 @@ import {
   shouldGroupBotRespond,
 } from "../src/lib/whatsapp/groupManager";
 import { generateIntelligentCohortReply } from "../src/lib/whatsapp/alumniIntelligence";
-import { handleUserWhatsAppMessage } from "../src/lib/whatsapp/alumniBot";
-import { handleAdminConversationalMessage } from "../src/lib/sentinel/conversationalAgent";
 import { handleAdminAutoRemediation } from "../src/lib/sentinel/autoRemediator";
 import { recordCommunityGroupActivity } from "../src/lib/whatsapp/communityIcebreaker";
-import { getCommunityGroupId, getDesignGroupId } from "../src/lib/whatsapp";
-import { createAdminClient } from "../src/lib/supabase/admin";
+import { getCommunityGroupId } from "../src/lib/whatsapp";
 import {
   backupSessionToSupabase,
   restoreSessionFromSupabase,
@@ -52,8 +48,42 @@ import {
 const AUTH_FOLDER = path.join(process.cwd(), ".baileys_auth");
 const logger = pino({ level: "silent" });
 
-// Nomor bot untuk pairing code (jika ingin pakai pairing code daripada scan QR)
+// =============================================================================
+// GLOBAL GATEWAY STATE & LOG BUFFER (Untuk Web Dashboard & Health Endpoint)
+// =============================================================================
+type GatewayState = "initializing" | "connecting" | "qr_ready" | "connected" | "disconnected";
+
+let currentSock: any = null;
+let gatewayStatus: GatewayState = "initializing";
+let activeUser: { id?: string; name?: string; lid?: string } | null = null;
+let currentQrDataUrl: string = "";
+let currentPairingCode: string = "";
+let lastDisconnectInfo: string = "";
 let pairingPhoneArg = "";
+
+interface LogEntry {
+  time: string;
+  level: "info" | "warn" | "error" | "success";
+  msg: string;
+}
+
+const activityLogs: LogEntry[] = [];
+
+function addLog(msg: string, level: LogEntry["level"] = "info") {
+  const time = new Intl.DateTimeFormat("id-ID", {
+    timeZone: "Asia/Jakarta",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date());
+
+  activityLogs.push({ time, level, msg });
+  if (activityLogs.length > 100) activityLogs.shift();
+  console.log(`[${time}] ${msg}`);
+}
+
+// Deteksi argumen pairing di CLI
 const pairingArgIndex = process.argv.indexOf("--pairing");
 if (pairingArgIndex !== -1) {
   const nextArg = process.argv[pairingArgIndex + 1];
@@ -69,7 +99,13 @@ if (pairingArgIndex !== -1) {
 
 let isReconnecting = false;
 
+// =============================================================================
+// BAILEYS WHATSAPP SOCKET CORE
+// =============================================================================
 async function startBaileysGateway() {
+  gatewayStatus = "connecting";
+  addLog("🚀 Memulai inisialisasi Baileys WhatsApp Gateway...");
+
   if (!fs.existsSync(AUTH_FOLDER)) {
     fs.mkdirSync(AUTH_FOLDER, { recursive: true });
   }
@@ -77,19 +113,20 @@ async function startBaileysGateway() {
   // Otomatis pulihkan sesi dari Supabase Storage jika dijalankan di cloud container
   const credsFile = path.join(AUTH_FOLDER, "creds.json");
   if (!fs.existsSync(credsFile)) {
-    await restoreSessionFromSupabase(AUTH_FOLDER);
+    addLog("☁️ Memeriksa cadangan sesi di Supabase Storage...");
+    const restored = await restoreSessionFromSupabase(AUTH_FOLDER);
+    if (restored) {
+      addLog("✅ Sesi WhatsApp berhasil dipulihkan dari Supabase Storage!", "success");
+    } else {
+      addLog("ℹ️ Belum ada sesi tersimpan di Supabase Storage, perlu login awal.", "warn");
+    }
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   const { version, isLatest } = await fetchLatestBaileysVersion();
 
-  console.log("\n=======================================================");
-  console.log(`🤖 EXPEDIENT 43 - SELF-HOSTED WHATSAPP GATEWAY (BAILEYS)`);
-  console.log(`📦 WhatsApp Web Version: v${version.join(".")} (${isLatest ? "Latest" : "Outdated"})`);
-  console.log(`📁 Auth Folder: ${AUTH_FOLDER}`);
-  console.log("=======================================================\n");
+  addLog(`📦 WhatsApp Web Version: v${version.join(".")} (${isLatest ? "Latest" : "Outdated"})`);
 
-  // In-memory message store untuk retry handshake & pelacakan pesan terkirim
   const msgStore = new Map<string, proto.IMessage>();
   const sentMessageIds = new Set<string>();
 
@@ -113,7 +150,9 @@ async function startBaileysGateway() {
     },
   });
 
-  // Helper pengiriman pesan yang aman & tahan banting (fallback otomatis tanpa quote jika quote bermasalah)
+  currentSock = sock;
+
+  // Helper pengiriman pesan yang aman & tahan banting
   const sendReply = async (targetJid: string, text: string, quotedMessage?: any) => {
     try {
       const res = quotedMessage
@@ -126,19 +165,16 @@ async function startBaileysGateway() {
           if (first) sentMessageIds.delete(first);
         }
       }
-      console.log(`📤 [REPLY-SUCCESS] Berhasil terkirim ke ${targetJid}: "${text.slice(0, 55).replace(/\n/g, " ")}..."`);
+      addLog(`📤 [REPLY-SUCCESS] Terkirim ke ${targetJid}: "${text.slice(0, 50).replace(/\n/g, " ")}..."`, "success");
       return res;
     } catch (err: any) {
-      console.warn(`[SEND-REPLY-FALLBACK] Mencoba kirim tanpa quote ke ${targetJid}:`, err.message);
+      addLog(`⚠️ [SEND-FALLBACK] Mengirim tanpa quote ke ${targetJid}: ${err.message}`, "warn");
       try {
         const res = await sock.sendMessage(targetJid, { text });
-        if (res?.key?.id) {
-          sentMessageIds.add(res.key.id);
-        }
-        console.log(`📤 [REPLY-SUCCESS-FALLBACK] Berhasil terkirim tanpa quote ke ${targetJid}: "${text.slice(0, 55).replace(/\n/g, " ")}..."`);
+        if (res?.key?.id) sentMessageIds.add(res.key.id);
         return res;
       } catch (err2: any) {
-        console.error(`[SEND-REPLY-FAILED] Gagal mengirim pesan ke ${targetJid}:`, err2.message);
+        addLog(`❌ [SEND-FAILED] Gagal kirim pesan ke ${targetJid}: ${err2.message}`, "error");
         return null;
       }
     }
@@ -146,97 +182,41 @@ async function startBaileysGateway() {
 
   let pairingCodeRequested = false;
 
-  // Simpan kredensial sesi saat ada pembaruan token & sync ke Supabase
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     backupSessionToSupabase(AUTH_FOLDER).catch(() => {});
   });
 
-  // Monitor status koneksi WhatsApp
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // 1. Jika mode pairing aktif, minta kode pairing saat soket siap (saat QR dipancarkan)
+    // 1. Jika mode pairing aktif via argumen
     if (qr && pairingPhoneArg && !sock.authState.creds.registered && !pairingCodeRequested) {
       pairingCodeRequested = true;
       const cleanPhone = pairingPhoneArg.replace(/\D/g, "");
-      console.log(`\n⏳ Meminta Kode Pairing WhatsApp untuk nomor: ${cleanPhone}...`);
+      addLog(`⏳ Meminta Kode Pairing WhatsApp untuk nomor: ${cleanPhone}...`, "info");
       try {
         const code = await sock.requestPairingCode(cleanPhone);
-        console.log("\n=======================================================");
-        console.log(`🔑 KODE PAIRING WHATSAPP:  👉  ${code}  👈`);
-        console.log("1. Buka WhatsApp di HP Anda");
-        console.log("2. Buka Titik 3 / Setelan -> Perangkat Tertaut");
-        console.log("3. Pilih 'Tautkan dengan nomor telepon saja'");
-        console.log(`4. Masukkan kode 8 karakter di atas: ${code}`);
-        console.log("=======================================================\n");
+        currentPairingCode = code;
+        gatewayStatus = "qr_ready";
+        addLog(`🔑 KODE PAIRING WHATSAPP: 👉 ${code} 👈`, "success");
       } catch (err: any) {
-        console.error("Gagal meminta pairing code:", err.message);
+        addLog(`❌ Gagal meminta pairing code: ${err.message}`, "error");
       }
     }
-    // 2. Jika mode QR biasa, cetak visual QR di browser & terminal
-    else if (qr && !pairingPhoneArg) {
-      // Buat file HTML QR beresolusi tinggi dan buka otomatis di browser
+    // 2. Jika ada QR code
+    else if (qr) {
+      gatewayStatus = "qr_ready";
       try {
-        const qrDataUrl = await QRCode.toDataURL(qr, { scale: 10, margin: 2 });
-        const htmlContent = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Scan WhatsApp Bot - Expedient 43</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0c1317; color: #e9edef; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
-    .card { background: #111b21; padding: 36px 40px; border-radius: 20px; box-shadow: 0 12px 40px rgba(0,0,0,0.6); text-align: center; border: 1px solid #222e35; max-width: 420px; width: 100%; }
-    h2 { margin: 0 0 8px; color: #25d366; font-size: 22px; }
-    p { margin: 6px 0; color: #8696a0; font-size: 14px; line-height: 1.5; }
-    .qr-container { background: #ffffff; padding: 18px; border-radius: 16px; margin: 24px auto; display: inline-block; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
-    img { display: block; width: 280px; height: 280px; }
-    .step-box { background: #1f2c34; border-radius: 12px; padding: 14px; margin-top: 16px; text-align: left; }
-    .step { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-size: 13px; color: #d1d7db; }
-    .badge { background: #00a884; color: white; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; flex-shrink: 0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div style="font-size: 40px; margin-bottom: 8px;">🤖</div>
-    <h2>Scan WhatsApp Bot</h2>
-    <p>Expedient Generation 43 Multi-Device</p>
-    
-    <div class="qr-container">
-      <img src="${qrDataUrl}" alt="WhatsApp QR Code" />
-    </div>
-
-    <div class="step-box">
-      <div class="step"><span class="badge">1</span> Buka WhatsApp di HP Anda</div>
-      <div class="step"><span class="badge">2</span> Buka Titik Tiga (Setelan) &rarr; <b>Perangkat Tertaut</b></div>
-      <div class="step"><span class="badge">3</span> Ketuk <b>Tautkan Perangkat</b> lalu arahkan kamera ke gambar QR ini</div>
-    </div>
-  </div>
-</body>
-</html>`;
-
-        const qrHtmlPath = path.join(process.cwd(), "wa-qr.html");
-        fs.writeFileSync(qrHtmlPath, htmlContent, "utf8");
-
-        if (process.platform === "win32") {
-          exec(`start "" "${qrHtmlPath}"`);
-        } else if (process.platform === "darwin") {
-          exec(`open "${qrHtmlPath}"`);
-        }
+        currentQrDataUrl = await QRCode.toDataURL(qr, { scale: 8, margin: 2 });
       } catch (_) {}
 
-      console.log("\n=======================================================");
-      console.log("📲 GAMBAR QR CODE SUDAH DIBUKA DI BROWSER ANDA!");
-      console.log("   (Buka WhatsApp -> Perangkat Tertaut -> Scan gambar di browser)\n");
       try {
         qrcode.setErrorLevel("L");
         qrcode.generate(qr, { small: true });
-      } catch (qrErr: any) {
-        console.log("QR Data:", qr);
-      }
-      console.log("=======================================================");
-      console.log("💡 Tips: Jika browser tidak terbuka otomatis, buka file 'wa-qr.html'");
-      console.log("   atau gunakan kode pairing: npm run wa:bot -- --pairing=6285151771289\n");
+      } catch (_) {}
+
+      addLog("📲 QR Code WhatsApp siap di-scan via Web Dashboard atau terminal!", "warn");
     }
 
     if (connection === "close") {
@@ -245,9 +225,12 @@ async function startBaileysGateway() {
       const isForbidden = statusCode === 403 || statusCode === 401;
       const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
 
-      console.warn(`[WA-DISCONNECT] Status code: ${statusCode}`);
+      lastDisconnectInfo = `Status: ${statusCode || "unknown"}`;
+      activeUser = null;
+      gatewayStatus = isLoggedOut || isForbidden ? "disconnected" : "connecting";
 
-      // Hentikan listener lama dan tutup socket lama agar tidak ada tumpang tindih
+      addLog(`⚠️ WhatsApp terputus (code: ${statusCode}).`, "warn");
+
       try {
         sock.ev.removeAllListeners("connection.update");
         sock.ev.removeAllListeners("messages.upsert");
@@ -255,23 +238,21 @@ async function startBaileysGateway() {
         sock.ws?.close();
       } catch (_) {}
 
-      // 1. RESTART REQUIRED (515) -> PAIRING BERHASIL! Reconnect langsung dalam 1 detik!
       if (isRestartRequired) {
-        console.log("⚡ WhatsApp meminta restart sesi (Handshake/Pairing Berhasil!). Menyambungkan ulang sekarang...");
+        addLog("⚡ WhatsApp meminta restart sesi (Handshake berhasil!). Menyambungkan ulang...", "info");
         setTimeout(() => startBaileysGateway(), 1000);
         return;
       }
 
       if (isLoggedOut || isForbidden) {
-        console.error("❌ Akun terputus/logout dari WhatsApp. Hapus folder .baileys_auth jika ingin scan ulang.");
+        addLog("❌ Akun terputus/logout dari WhatsApp. Perlu scan ulang.", "error");
+        currentQrDataUrl = "";
         return;
       }
 
-      // Cegah reconnect ganda yang menyebabkan tumpang tindih socket
       if (isReconnecting) return;
       isReconnecting = true;
-
-      console.log("🔄 Menghubungkan ulang dalam 3 detik...");
+      addLog("🔄 Menghubungkan ulang dalam 3 detik...", "info");
       setTimeout(async () => {
         try {
           await startBaileysGateway();
@@ -281,30 +262,31 @@ async function startBaileysGateway() {
       }, 3000);
     } else if (connection === "open") {
       isReconnecting = false;
-      console.log("\n=======================================================");
-      console.log("✅ [WA-GATEWAY-CONNECTED] WhatsApp Bot BERHASIL TERHUBUNG!");
-      console.log(`👤 Device ID: ${sock.user?.id || "Connected"}`);
-      console.log(`🆔 Device LID: ${sock.user?.lid || "None"}`);
-      console.log("🚀 Fitur Multimodal (Gambar, Stiker, Voice Note, Video) SIAP 100% GRATIS!\n");
-      console.log("=======================================================\n");
+      gatewayStatus = "connected";
+      activeUser = {
+        id: sock.user?.id || "Connected",
+        name: sock.user?.name || "Expedient Generation",
+        lid: sock.user?.lid,
+      };
+      currentQrDataUrl = "";
+      currentPairingCode = "";
+
+      addLog(`✅ [CONNECTED] WhatsApp Bot BERHASIL TERHUBUNG! Device: ${sock.user?.id || "OK"}`, "success");
 
       // Cadangkan sesi ke Supabase Storage secara otomatis saat terhubung
       backupSessionToSupabase(AUTH_FOLDER).catch(() => {});
-
-      // Bersihkan file HTML QR jika ada
-      try {
-        const qrHtmlPath = path.join(process.cwd(), "wa-qr.html");
-        if (fs.existsSync(qrHtmlPath)) fs.unlinkSync(qrHtmlPath);
-      } catch (_) {}
     }
   });
 
-  // Listener Pesan Masuk
+  // ===========================================================================
+  // LISTENER PESAN MASUK (MESSAGES.UPSERT)
+  // ===========================================================================
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+
     for (const m of messages) {
       try {
         const msgId = m.key.id;
-        // 1. Abaikan jika pesan ini baru saja dikirim oleh bot kita sendiri
         if (msgId && sentMessageIds.has(msgId)) {
           continue;
         }
@@ -312,7 +294,6 @@ async function startBaileysGateway() {
         const remoteJid = m.key.remoteJid || "";
         if (!m.message || remoteJid === "status@broadcast") continue;
 
-        // Simpan ke in-memory store untuk retry handshake WhatsApp
         if (msgId && m.message) {
           msgStore.set(msgId, m.message);
           if (msgStore.size > 200) {
@@ -331,7 +312,7 @@ async function startBaileysGateway() {
         const botLid = sock.user?.lid ? sock.user.lid.split(":")[0] : "";
         const botUserId = sock.user?.id ? sock.user.id.split(":")[0] : "";
 
-        // Deteksi apakah user sedang menguji via fitur 'Pesan ke Diri Sendiri' (Note to Self)
+        // Deteksi chat ke diri sendiri
         const isSelfChat = !isGroup && (
           remoteJid.includes(botShortPhone) ||
           remoteJid.includes(botPhone) ||
@@ -343,15 +324,14 @@ async function startBaileysGateway() {
           senderPhone = botPhone;
         }
 
-        // Jika pesan dikirim dari akun bot sendiri (m.key.fromMe):
-        // HANYA proses jika ini adalah chat pribadi ke akun bot sendiri (Self Test).
-        // Jangan proses jika pengguna sedang mengetik ke orang lain atau ke grup (agar tidak membalas chat manual manusia).
-        if (m.key.fromMe && !isSelfChat) continue;
+        // Jangan proses pesan yang dikirim bot sendiri kecuali pesan ke diri sendiri
+        if (m.key.fromMe && !isSelfChat) {
+          continue;
+        }
 
         const rawMsg = m.message;
         const msgContent = (normalizeMessageContent(extractMessageContent(rawMsg) || rawMsg) || {}) as proto.IMessage;
 
-        // Ekstraksi Teks Pesan
         const messageText =
           msgContent.conversation ||
           msgContent.extendedTextMessage?.text ||
@@ -362,7 +342,6 @@ async function startBaileysGateway() {
           msgContent.editedMessage?.message?.protocolMessage?.editedMessage?.extendedTextMessage?.text ||
           "";
 
-        // Deteksi Konteks Pesan (Mention & Reply/Quote)
         const contextInfo =
           msgContent.extendedTextMessage?.contextInfo ||
           msgContent.imageMessage?.contextInfo ||
@@ -391,15 +370,9 @@ async function startBaileysGateway() {
           quotedParticipant.includes("89675010185") ||
           (botLid && quotedParticipant === botLid);
 
-        // ATURAN MUTLAK KECERDASAN GRUP:
-        // Di grup, bot HANYA merespons jika DI-TAG / DI-MENTION secara eksplisit (@bot/@nomor),
-        // atau namanya dipanggil langsung ("bot ...", "min ...", "!jadwal", "/menu").
-        // JANGAN PERNAH nimbrung / nyaut jika anggota sedang ngobrol santai antar sesama anggota!
-        const isDirectlyAddressed = isGroup
-          ? isBotMentioned
-          : isBotMentioned || isBotQuoted;
+        // Di grup: bot merespons jika di-mention ATAU jika pesan bot sebelumnya di-quote!
+        const isDirectlyAddressed = isBotMentioned || isBotQuoted;
 
-        // Cek Quoted Media (jika user mereply foto/stiker/audio lama sambil tag bot)
         const quotedMsgRaw = contextInfo?.quotedMessage;
         const quotedMsg = quotedMsgRaw
           ? ((normalizeMessageContent(extractMessageContent(quotedMsgRaw) || quotedMsgRaw) || {}) as proto.IMessage)
@@ -412,7 +385,6 @@ async function startBaileysGateway() {
         const quotedIsDocument = Boolean(quotedMsg?.documentMessage && !quotedMsg?.documentMessage?.mimetype?.startsWith("image/"));
         const quotedHasMedia = quotedIsImage || quotedIsSticker || quotedIsAudio || quotedIsVideo || quotedIsDocument;
 
-        // Deteksi Tipe Media Pesan Utama (Mendukung foto, stiker, VN, video note, dan dokumen gambar)
         const isImage = Boolean(msgContent.imageMessage || msgContent.documentMessage?.mimetype?.startsWith("image/"));
         const isSticker = Boolean(msgContent.stickerMessage);
         const isAudio = Boolean(msgContent.audioMessage);
@@ -420,11 +392,9 @@ async function startBaileysGateway() {
         const isDocument = Boolean(msgContent.documentMessage && !msgContent.documentMessage?.mimetype?.startsWith("image/"));
         const hasMedia = isImage || isSticker || isAudio || isVideo || isDocument;
 
-        console.log(`📩 [INCOMING-MSG] JID: ${remoteJid} | fromMe: ${m.key.fromMe} | Pengirim: ${senderName} (${senderPhone}) | Grup: ${isGroup} | Media: ${hasMedia} | Isi: "${messageText.slice(0, 60)}"`);
+        addLog(`📩 [INCOMING] ${senderName} (${senderPhone}) [Grup: ${isGroup}]: "${messageText.slice(0, 50)}"`);
 
-        // =====================================================================
-        // 1. PENANGANAN MEDIA LANGSUNG (Gambar, Stiker, Voice Note, Video Note)
-        // =====================================================================
+        // 1. PENANGANAN MEDIA LANGSUNG
         if (hasMedia) {
           const category: MultimodalMediaCategory = isSticker
             ? "sticker"
@@ -446,27 +416,16 @@ async function startBaileysGateway() {
             ? msgContent.imageMessage?.mimetype || msgContent.documentMessage?.mimetype || "image/jpeg"
             : "application/pdf";
 
-          console.log(`[BAILEYS-MEDIA-INCOMING] Tipe: ${category.toUpperCase()} | Dari: ${senderName} (${senderPhone}) | Grup: ${isGroup ? remoteJid : "PERSONAL"}`);
-
-          // Cek apakah bot harus merespons media ini:
-          // Di Grup Desain: Gambar/poster SELALU direview otomatis
-          // Di Grup Lain: Hanya jika di-tag atau diminta review
-          // Di Chat Pribadi: SELALU direspons!
           const shouldRespond = isGroup
             ? isDirectlyAddressed || shouldProcessGroupMedia(remoteJid, category, messageText)
             : true;
 
           if (shouldRespond) {
+            addLog(`🎨 [MEDIA-PROCESS] Memproses media ${category} dari ${senderName}...`);
             await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
 
             try {
-              // Download buffer media langsung dari server WhatsApp via Baileys
-              // Gunakan unboxed envelope agar Baileys tidak tertahan wrapper ephemeral
-              const unboxedMsg = {
-                key: m.key,
-                message: msgContent,
-              };
-
+              const unboxedMsg = { key: m.key, message: msgContent };
               let mediaBuffer: Buffer;
               try {
                 mediaBuffer = (await downloadMediaMessage(
@@ -484,9 +443,6 @@ async function startBaileysGateway() {
                 )) as Buffer;
               }
 
-              console.log(`[BAILEYS-MEDIA-DOWNLOADED] Ukuran: ${(mediaBuffer.length / 1024).toFixed(1)} KB. Menganalisis dengan Gemini Multimodal...`);
-
-              // Proses langsung dengan Gemini AI
               const multiRes = await processMultimodalBuffer({
                 base64Data: mediaBuffer.toString("base64"),
                 category,
@@ -499,26 +455,20 @@ async function startBaileysGateway() {
                 filename: `${category}_${Date.now()}`,
               });
 
-              // Kirim balasan langsung ke WhatsApp
               await sendReply(remoteJid, multiRes.replyText, m);
-              console.log(`[BAILEYS-MEDIA-REPLIED] Berhasil membalas ${category} ke ${remoteJid}`);
 
-              // Rekam aktivitas jika di grup komunitas untuk icebreaker
               if (remoteJid.includes("120363388633880584") || remoteJid === getCommunityGroupId()) {
                 recordCommunityGroupActivity(`[Media ${category}] ${messageText}`, senderName, senderPhone).catch(() => {});
               }
             } catch (mediaErr: any) {
-              console.error("[BAILEYS-MEDIA-ERROR]:", mediaErr.message);
-              await sendReply(remoteJid, "Maaf Sahabat, media tidak dapat diproses saat ini. Silakan kirimkan kembali ya!");
+              addLog(`❌ [MEDIA-ERR] ${mediaErr.message}`, "error");
+              await sendReply(remoteJid, "Maaf Sahabat, media belum dapat dianalisis saat ini. Silakan kirimkan kembali!");
             }
-
             continue;
           }
         }
 
-        // =====================================================================
-        // 2. PENANGANAN MEDIA YANG DI-REPLY/QUOTE (misal reply poster lama & tag bot)
-        // =====================================================================
+        // 2. PENANGANAN MEDIA YANG DI-QUOTE
         if (
           !hasMedia &&
           quotedHasMedia &&
@@ -549,16 +499,12 @@ async function startBaileysGateway() {
             ? quotedMsg?.imageMessage?.mimetype || "image/jpeg"
             : "application/pdf";
 
-          console.log(`[BAILEYS-QUOTED-MEDIA] User mereply media ${category} dengan pesan: "${messageText}"`);
+          addLog(`🎨 [QUOTED-MEDIA] Menganalisis media lama ${category}...`);
           await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
 
           try {
             const fakeQuotedMsgObj = {
-              key: {
-                remoteJid,
-                id: contextInfo?.stanzaId,
-                participant: contextInfo?.participant,
-              },
+              key: { remoteJid, id: contextInfo?.stanzaId, participant: contextInfo?.participant },
               message: quotedMsg,
             };
 
@@ -584,20 +530,18 @@ async function startBaileysGateway() {
             await sendReply(remoteJid, multiRes.replyText, m);
             continue;
           } catch (err: any) {
-            console.warn("[QUOTED-MEDIA-DOWNLOAD-FAILED]:", err.message);
-            // fallback ke penanganan teks biasa di bawah
+            addLog(`⚠️ [QUOTED-ERR] ${err.message}`, "warn");
           }
         }
 
-        // =====================================================================
         // 3. PENANGANAN PESAN TEKS & EMOJI
-        // =====================================================================
         if (!messageText) continue;
 
         if (isGroup) {
-          // CABANG A: GRUP GRAPHIC DESIGN
+          // CABANG A: GRUP DESAIN
           if (isDesignGroupId(remoteJid)) {
             if (isDirectlyAddressed || shouldDesignBotRespond(messageText)) {
+              addLog(`🖌️ [DESIGN-GROUP] Membalas di Grup Desain...`);
               await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
               const replyText = await handleDesignStudioConversation({
                 senderPhone,
@@ -608,9 +552,10 @@ async function startBaileysGateway() {
               await sendReply(remoteJid, replyText, m);
             }
           }
-          // CABANG B: GRUP KOMUNITAS / ANGKATAN
+          // CABANG B: GRUP ANGKATAN / KOMUNITAS
           else {
             if (isDirectlyAddressed || shouldGroupBotRespond(messageText)) {
+              addLog(`👥 [COMMUNITY-GROUP] Membalas di Grup Komunitas...`);
               await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
               const replyText = await generateIntelligentCohortReply({
                 messageText,
@@ -624,11 +569,13 @@ async function startBaileysGateway() {
               if (remoteJid.includes("120363388633880584") || remoteJid === getCommunityGroupId()) {
                 recordCommunityGroupActivity(messageText, senderName, senderPhone).catch(() => {});
               }
+            } else {
+              addLog(`ℹ️ [SKIP-GROUP] Pesan bukan untuk bot (tidak di-tag / tidak memanggil bot)`);
             }
           }
         } else {
-          // CABANG C: CHAT PRIBADI (1-ON-1)
-          console.log(`[BAILEYS-PRIVATE-CHAT] Menerima pesan pribadi dari: ${senderName} (${senderPhone}) | JID: ${remoteJid} | Isi: "${messageText}"`);
+          // CABANG C: CHAT PRIBADI
+          addLog(`💬 [PRIVATE-CHAT] Menerima chat pribadi dari ${senderName} (${senderPhone})`);
           await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
 
           const adminPhoneEnv = (process.env.ADMIN_WA_PHONE || "6282142877426").replace(/\D/g, "");
@@ -638,7 +585,6 @@ async function startBaileysGateway() {
             adminPhoneEnv.endsWith(senderPhone.slice(-9));
 
           if (isSenderAdmin && (messageText.startsWith("!") || messageText.startsWith("/fix") || messageText.toLowerCase().includes("remediasi"))) {
-            // Periksa auto-remediasi jika diminta
             const remResult = await handleAdminAutoRemediation(senderPhone, messageText);
             if (remResult.action !== "not_a_sentinel_command") {
               await sendReply(remoteJid, remResult.message, m);
@@ -646,7 +592,6 @@ async function startBaileysGateway() {
             }
           }
 
-          // Untuk semua chat pribadi (Admin maupun Alumni): gunakan AI Intelligence resmi angkatan 2025 secara langsung via Baileys socket!
           const replyText = await generateIntelligentCohortReply({
             messageText,
             senderPhone,
@@ -655,50 +600,457 @@ async function startBaileysGateway() {
           });
 
           await sendReply(remoteJid, replyText, m);
-          console.log(`[BAILEYS-PRIVATE-REPLIED] Berhasil membalas chat pribadi ke ${remoteJid}`);
         }
       } catch (msgErr: any) {
-        console.error("[BAILEYS-MSG-ERROR]:", msgErr);
+        addLog(`❌ [BAILEYS-MSG-ERR] ${msgErr.message}`, "error");
       }
     }
-  });
-
-  // HTTP Health Check Server untuk Cloud Hosting (Back4App / Render / Koyeb)
-  const HTTP_PORT = parseInt(process.env.PORT || process.env.GATEWAY_PORT || "8080", 10);
-  const healthServer = http.createServer((req, res) => {
-    if (req.url === "/health" || req.url === "/" || req.url === "/ping") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "online",
-          bot: "Expedient 43 WhatsApp Gateway",
-          device: sock.user?.id || "connected",
-          uptimeSeconds: Math.round(process.uptime()),
-          timestamp: new Date().toISOString(),
-        })
-      );
-    } else {
-      res.writeHead(404);
-      res.end("Not Found");
-    }
-  });
-
-  healthServer.on("error", (err: any) => {
-    if (err.code === "EADDRINUSE") {
-      console.warn(`⚠️ [CLOUD-KEEP-ALIVE] Port ${HTTP_PORT} sedang digunakan. HTTP health server dilewati.`);
-    } else {
-      console.error(`⚠️ [CLOUD-KEEP-ALIVE] Health server error:`, err);
-    }
-  });
-
-  healthServer.listen(HTTP_PORT, "0.0.0.0", () => {
-    console.log(`🌐 [CLOUD-KEEP-ALIVE] HTTP Health Server aktif di 0.0.0.0:${HTTP_PORT} (Back4App Ready)`);
   });
 
   return sock;
 }
 
-// Jalankan gateway
+// =============================================================================
+// HTTP SERVER & WEB DASHBOARD (Dijalankan SEKALI di Root Level, Port 10000 / $PORT)
+// =============================================================================
+const HTTP_PORT = parseInt(process.env.PORT || process.env.GATEWAY_PORT || "10000", 10);
+
+const healthServer = http.createServer(async (req, res) => {
+  const url = req.url || "/";
+
+  // 1. JSON Health Check Endpoint untuk Render
+  if (url === "/health" || url === "/ping") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "online",
+        waStatus: gatewayStatus,
+        device: activeUser?.id || null,
+        name: activeUser?.name || null,
+        qrReady: Boolean(currentQrDataUrl),
+        pairingCode: currentPairingCode || null,
+        uptimeSeconds: Math.round(process.uptime()),
+        timestamp: new Date().toISOString(),
+      })
+    );
+    return;
+  }
+
+  // 2. Real-time Status API untuk Polling Frontend
+  if (url === "/api/status") {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.end(
+      JSON.stringify({
+        gatewayStatus,
+        activeUser,
+        currentQrDataUrl,
+        currentPairingCode,
+        lastDisconnectInfo,
+        uptimeSeconds: Math.round(process.uptime()),
+        logs: activityLogs.slice(-40),
+      })
+    );
+    return;
+  }
+
+  // 3. API Meminta Pairing Code On-Demand
+  if (url === "/api/pair" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      try {
+        const parsed = JSON.parse(body || "{}");
+        const phone = (parsed.phone || "6285151771289").replace(/\D/g, "");
+        if (!currentSock) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "Socket belum siap" }));
+          return;
+        }
+
+        addLog(`⏳ Permintaan kode pairing untuk nomor: ${phone}...`);
+        const code = await currentSock.requestPairingCode(phone);
+        currentPairingCode = code;
+        addLog(`🔑 KODE PAIRING BERHASIL: 👉 ${code} 👈`, "success");
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, code }));
+      } catch (err: any) {
+        addLog(`❌ Gagal request pairing code: ${err.message}`, "error");
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // 4. Web Dashboard Visual (Dark Mode Premium)
+  if (url === "/" || url === "/qr" || url === "/dashboard") {
+    const html = `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Expedient 43 - WhatsApp Bot Gateway</title>
+  <style>
+    :root {
+      --bg: #0b141a;
+      --card: #111b21;
+      --border: #222e35;
+      --text: #e9edef;
+      --text-muted: #8696a0;
+      --primary: #00a884;
+      --primary-hover: #06cf9c;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+    }
+    .container {
+      width: 100%;
+      max-width: 680px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .header {
+      text-align: center;
+      padding: 12px 0;
+    }
+    .header h1 {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    .header p {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .status-connected { background: rgba(0, 168, 132, 0.15); color: #25d366; border: 1px solid rgba(37, 211, 102, 0.3); }
+    .status-qr { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .status-connecting { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+    .status-disconnected { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    
+    .qr-box {
+      text-align: center;
+      margin: 16px 0;
+    }
+    .qr-img {
+      background: #fff;
+      padding: 14px;
+      border-radius: 14px;
+      display: inline-block;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      width: 260px;
+      height: 260px;
+    }
+    .instructions {
+      background: #1f2c34;
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 13px;
+      color: #d1d7db;
+      line-height: 1.6;
+      margin-top: 14px;
+    }
+    .instructions ol { padding-left: 20px; }
+    .instructions li { margin-bottom: 6px; }
+
+    .terminal {
+      background: #000;
+      border: 1px solid #222e35;
+      border-radius: 12px;
+      padding: 14px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      max-height: 260px;
+      overflow-y: auto;
+      color: #a0aec0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .log-line { display: flex; gap: 8px; }
+    .log-time { color: #4a5568; flex-shrink: 0; }
+    .log-success { color: #48bb78; }
+    .log-warn { color: #ecc94b; }
+    .log-error { color: #f56565; }
+    .log-info { color: #cbd5e0; }
+
+    .form-pairing {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .input-phone {
+      flex: 1;
+      background: #1f2c34;
+      border: 1px solid #2a3942;
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #fff;
+      font-size: 14px;
+      outline: none;
+    }
+    .input-phone:focus { border-color: var(--primary); }
+    .btn {
+      background: var(--primary);
+      color: #0b141a;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 18px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: var(--primary-hover); }
+    .pairing-display {
+      background: #202c33;
+      border: 2px dashed #00a884;
+      border-radius: 10px;
+      padding: 14px;
+      text-align: center;
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 4px;
+      color: #25d366;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🤖 Expedient 43 Gateway</h1>
+      <p>Self-Hosted WhatsApp Bot &bull; 24/7 Cloud Runner on Render</p>
+    </div>
+
+    <div class="card">
+      <div id="statusBadge" class="status-badge status-connecting">
+        <span id="statusDot">●</span> <span id="statusText">Memeriksa status...</span>
+      </div>
+
+      <div id="connectedView" style="display: none;">
+        <h3 style="color: #25d366; margin-bottom: 8px;">✅ Bot Aktif & Siap Digunakan</h3>
+        <p style="color: var(--text-muted); font-size: 14px; line-height: 1.6;">
+          Akun WhatsApp bot berhasil tersambung. Bot akan membalas secara instan di:
+        </p>
+        <ul style="margin: 12px 0 16px 20px; font-size: 14px; color: #d1d7db; line-height: 1.6;">
+          <li><b>Chat Pribadi:</b> Balas otomatis semua pesan alumni / admin.</li>
+          <li><b>Grup WhatsApp:</b> Balas saat di-mention (@bot) atau dipanggil namanya.</li>
+          <li><b>Multimodal:</b> Menganalisis gambar, stiker, VN, dan video via Gemini AI.</li>
+        </ul>
+        <div style="background: #1f2c34; border-radius: 10px; padding: 12px; font-size: 13px;">
+          <div><b>Device JID:</b> <span id="deviceJid">-</span></div>
+          <div style="margin-top: 4px;"><b>Nama Bot:</b> <span id="botName">-</span></div>
+          <div style="margin-top: 4px;"><b>Uptime:</b> <span id="uptimeText">-</span></div>
+        </div>
+      </div>
+
+      <div id="qrView" style="display: none;">
+        <h3 style="color: #fbbf24; margin-bottom: 6px;">📲 Tautkan Perangkat WhatsApp</h3>
+        <p style="color: var(--text-muted); font-size: 14px;">
+          Pindai kode QR di bawah menggunakan aplikasi WhatsApp di HP Anda:
+        </p>
+
+        <div class="qr-box">
+          <img id="qrImage" class="qr-img" src="" alt="WhatsApp QR Code" />
+        </div>
+
+        <div class="instructions">
+          <ol>
+            <li>Buka aplikasi <b>WhatsApp</b> di HP Anda</li>
+            <li>Ketuk <b>Titik Tiga</b> (Setelan) &rarr; pilih <b>Perangkat Tertaut</b></li>
+            <li>Ketuk <b>Tautkan Perangkat</b> lalu arahkan kamera ke kode QR di atas</li>
+          </ol>
+        </div>
+
+        <div style="margin-top: 20px; border-top: 1px solid #222e35; padding-top: 16px;">
+          <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">
+            Atau minta <b>Kode Pairing (8 Digit)</b> jika tidak bisa scan kamera:
+          </p>
+          <div class="form-pairing">
+            <input type="text" id="phoneInput" class="input-phone" placeholder="Contoh: 6285151771289" value="6285151771289" />
+            <button id="pairBtn" class="btn" onclick="requestPairing()">Minta Kode</button>
+          </div>
+          <div id="pairingCodeBox" class="pairing-display" style="display: none;"></div>
+        </div>
+      </div>
+
+      <div id="connectingView" style="display: none; text-align: center; padding: 30px 0;">
+        <div style="font-size: 32px; margin-bottom: 12px;">⏳</div>
+        <h3>Sedang Menghubungkan ke WhatsApp...</h3>
+        <p style="color: var(--text-muted); font-size: 14px; margin-top: 6px;">
+          Menunggu handshake socket & pemulihan sesi cloud.
+        </p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="font-size: 15px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+        <span>📜 Terminal Log Realtime</span>
+        <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">Auto-refresh tiap 3 detik</span>
+      </h3>
+      <div id="terminalBox" class="terminal">
+        <div class="log-line"><span class="log-time">[Init]</span> Memuat event gateway...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function fetchStatus() {
+      try {
+        const res = await fetch("/api/status");
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const badge = document.getElementById("statusBadge");
+        const statusText = document.getElementById("statusText");
+        const connectedView = document.getElementById("connectedView");
+        const qrView = document.getElementById("qrView");
+        const connectingView = document.getElementById("connectingView");
+
+        badge.className = "status-badge";
+
+        if (data.gatewayStatus === "connected") {
+          badge.classList.add("status-connected");
+          statusText.textContent = "TERHUBUNG (Online)";
+          connectedView.style.display = "block";
+          qrView.style.display = "none";
+          connectingView.style.display = "none";
+
+          document.getElementById("deviceJid").textContent = data.activeUser?.id || "Connected";
+          document.getElementById("botName").textContent = data.activeUser?.name || "Expedient Generation";
+          
+          const mins = Math.floor(data.uptimeSeconds / 60);
+          const secs = data.uptimeSeconds % 60;
+          document.getElementById("uptimeText").textContent = mins + " menit " + secs + " detik";
+        } else if (data.gatewayStatus === "qr_ready" && data.currentQrDataUrl) {
+          badge.classList.add("status-qr");
+          statusText.textContent = "MENUNGGU SCAN QR";
+          connectedView.style.display = "none";
+          qrView.style.display = "block";
+          connectingView.style.display = "none";
+
+          document.getElementById("qrImage").src = data.currentQrDataUrl;
+          if (data.currentPairingCode) {
+            const pBox = document.getElementById("pairingCodeBox");
+            pBox.textContent = data.currentPairingCode;
+            pBox.style.display = "block";
+          }
+        } else {
+          badge.classList.add("status-connecting");
+          statusText.textContent = "MENYAMBUNGKAN...";
+          connectedView.style.display = "none";
+          qrView.style.display = "none";
+          connectingView.style.display = "block";
+        }
+
+        // Render Logs
+        if (data.logs && data.logs.length > 0) {
+          const tBox = document.getElementById("terminalBox");
+          tBox.innerHTML = data.logs.map(l => {
+            let cls = "log-info";
+            if (l.level === "success") cls = "log-success";
+            if (l.level === "warn") cls = "log-warn";
+            if (l.level === "error") cls = "log-error";
+            return '<div class="log-line"><span class="log-time">[' + l.time + ']</span> <span class="' + cls + '">' + escapeHtml(l.msg) + '</span></div>';
+          }).join("");
+          tBox.scrollTop = tBox.scrollHeight;
+        }
+      } catch (err) {
+        console.error("Poll error:", err);
+      }
+    }
+
+    function escapeHtml(str) {
+      return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    async function requestPairing() {
+      const phone = document.getElementById("phoneInput").value.trim();
+      if (!phone) return alert("Masukkan nomor telepon");
+      const btn = document.getElementById("pairBtn");
+      btn.disabled = true;
+      btn.textContent = "Meminta...";
+
+      try {
+        const res = await fetch("/api/pair", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone }),
+        });
+        const data = await res.json();
+        if (data.success && data.code) {
+          const pBox = document.getElementById("pairingCodeBox");
+          pBox.textContent = data.code;
+          pBox.style.display = "block";
+        } else {
+          alert("Gagal: " + (data.error || "Gagal meminta kode pairing"));
+        }
+      } catch (e) {
+        alert("Error: " + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Minta Kode";
+      }
+    }
+
+    fetchStatus();
+    setInterval(fetchStatus, 3000);
+  </script>
+</body>
+</html>`;
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(html);
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("Not Found");
+});
+
+healthServer.listen(HTTP_PORT, "0.0.0.0", () => {
+  addLog(`🌐 [WEB-DASHBOARD] Aktif di 0.0.0.0:${HTTP_PORT} (Render Ready)`);
+});
+
+// Jalankan gateway Baileys
 startBaileysGateway().catch((err) => {
-  console.error("[BAILEYS-FATAL]:", err);
+  addLog(`❌ [BAILEYS-FATAL] ${err.message}`, "error");
 });
