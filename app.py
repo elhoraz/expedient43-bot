@@ -7,6 +7,18 @@ import shutil
 from collections import deque
 import gradio as gr
 
+# Hugging Face ZeroGPU Environment Compatibility
+try:
+    import spaces
+    @spaces.GPU(duration=10)
+    def check_gpu_status():
+        return "ZeroGPU Online"
+    
+    # Panggil saat startup untuk inisialisasi ZeroGPU supervisor
+    check_gpu_status()
+except Exception as e:
+    print(f"ZeroGPU init notice: {e}", flush=True)
+
 # Buffer log real-time (150 baris terakhir)
 log_buffer = deque(maxlen=150)
 bot_process = None

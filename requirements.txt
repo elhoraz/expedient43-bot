@@ -1,1 +1,2 @@
-# Gradio requirements for Hugging Face Space
+spaces
+gradio
