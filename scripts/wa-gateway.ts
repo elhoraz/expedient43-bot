@@ -189,6 +189,70 @@ async function startBaileysGateway() {
     }
   };
 
+  // Helper Generate & Kirim Gambar AI (Pollinations Flux AI - 100% Gratis & Berkualitas Tinggi)
+  const generateAndSendImage = async (prompt: string, targetJid: string, quotedMessage?: any) => {
+    try {
+      addLog(`🎨 [GENERATE-IMAGE] Membuat gambar untuk: "${prompt}"...`);
+      await sock.sendPresenceUpdate("composing", targetJid).catch(() => {});
+      const encodedPrompt = encodeURIComponent(prompt.trim());
+      const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&model=flux&nologo=true&seed=${Math.floor(Math.random() * 1000000)}`;
+
+      const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(45000) });
+      if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+      const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+
+      await sock.sendMessage(
+        targetJid,
+        {
+          image: imgBuffer,
+          caption: `🎨 *Hasil Gambar AI (Flux):*\n"${prompt}"\n\n_Dibuat otomatis oleh Expedient 43 AI Companion_`,
+        },
+        { quoted: quotedMessage }
+      );
+      addLog(`📤 [IMAGE-SENT] Berhasil mengirim gambar ke ${targetJid}`, "success");
+      return true;
+    } catch (err: any) {
+      addLog(`❌ [GENERATE-IMAGE-ERR] ${err.message}`, "error");
+      await sendReply(targetJid, `Maaf Sahabat, pembuatan gambar sedang sibuk (${err.message}). Silakan coba lagi ya!`, quotedMessage);
+      return false;
+    }
+  };
+
+  // Helper Generate & Kirim Voice Note / Suara (Google Text-to-Speech & WhatsApp PTT Audio)
+  const generateAndSendVoiceNote = async (text: string, targetJid: string, quotedMessage?: any) => {
+    try {
+      addLog(`🎙️ [GENERATE-VOICE] Mengonversi teks ke rekaman suara: "${text.slice(0, 45)}..."`);
+      await sock.sendPresenceUpdate("recording", targetJid).catch(() => {});
+
+      // Bersihkan teks dari format markdown/bintang agar intonasi suara jernih
+      const cleanText = text.replace(/[*_~`]/g, "").slice(0, 250).trim();
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=id&client=tw-ob`;
+
+      const ttsRes = await fetch(ttsUrl, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!ttsRes.ok) throw new Error(`HTTP ${ttsRes.status}`);
+      const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());
+
+      await sock.sendMessage(
+        targetJid,
+        {
+          audio: audioBuffer,
+          mimetype: "audio/mp4",
+          ptt: true, // ptt: true menghasilkan Voice Note asli dengan ikon mic hijau di WhatsApp!
+        },
+        { quoted: quotedMessage }
+      );
+      addLog(`📤 [VOICE-SENT] Berhasil mengirim Voice Note ke ${targetJid}`, "success");
+      return true;
+    } catch (err: any) {
+      addLog(`❌ [GENERATE-VOICE-ERR] ${err.message}`, "error");
+      await sendReply(targetJid, `Maaf Sahabat, konversi suara belum dapat dikirimkan (${err.message}).`, quotedMessage);
+      return false;
+    }
+  };
+
   let pairingCodeRequested = false;
 
   sock.ev.on("creds.update", async () => {
@@ -562,6 +626,55 @@ async function startBaileysGateway() {
         // 3. PENANGANAN PESAN TEKS & EMOJI
         if (!messageText) continue;
 
+        const lower = messageText.trim().toLowerCase();
+
+        // =====================================================================
+        // FITUR AI GENERATOR: GAMBAR (Flux AI) & SUARA (Voice Note / VN)
+        // =====================================================================
+        const isImageGenRequest =
+          lower.startsWith("/gambar ") ||
+          lower.startsWith("!gambar ") ||
+          lower.startsWith("/image ") ||
+          lower.startsWith("!image ") ||
+          lower.startsWith("/draw ") ||
+          lower.startsWith("!draw ") ||
+          lower.startsWith("buatkan gambar ") ||
+          lower.startsWith("bikin gambar ") ||
+          lower.startsWith("generate gambar ") ||
+          lower.startsWith("lukiskan ") ||
+          lower.startsWith("gambarin ");
+
+        if (isImageGenRequest && (isGroup ? isDirectlyAddressed || shouldGroupBotRespond(messageText) : true)) {
+          const prompt = messageText
+            .replace(/^(\/gambar|!gambar|\/image|!image|\/draw|!draw|buatkan gambar|bikin gambar|generate gambar|lukiskan|gambarin)\s+/i, "")
+            .trim();
+          if (prompt) {
+            await sendReply(remoteJid, `🎨 Sedang melukis gambar *"${prompt}"*... Tunggu sebentar ya Sahabat! ⏳`, m);
+            await generateAndSendImage(prompt, remoteJid, m);
+            continue;
+          }
+        }
+
+        const isVoiceGenRequest =
+          lower.startsWith("/vn ") ||
+          lower.startsWith("!vn ") ||
+          lower.startsWith("/suara ") ||
+          lower.startsWith("!suara ") ||
+          lower.startsWith("/voice ") ||
+          lower.startsWith("!voice ") ||
+          lower.startsWith("bicara:") ||
+          lower.startsWith("ngomong:");
+
+        if (isVoiceGenRequest && (isGroup ? isDirectlyAddressed || shouldGroupBotRespond(messageText) : true)) {
+          const voiceText = messageText
+            .replace(/^(\/vn|!vn|\/suara|!suara|\/voice|!voice|bicara:|ngomong:)\s*/i, "")
+            .trim();
+          if (voiceText) {
+            await generateAndSendVoiceNote(voiceText, remoteJid, m);
+            continue;
+          }
+        }
+
         if (isGroup) {
           // CABANG A: GRUP DESAIN
           if (isDesignGroupId(remoteJid)) {
@@ -589,7 +702,17 @@ async function startBaileysGateway() {
                 isGroup: true,
                 groupId: remoteJid,
               });
-              await sendReply(remoteJid, replyText, m);
+              const wantsVoiceReply =
+                lower.includes("pakai vn") ||
+                lower.includes("pakai suara") ||
+                lower.includes("balas vn") ||
+                lower.includes("kirim vn");
+
+              if (wantsVoiceReply) {
+                await generateAndSendVoiceNote(replyText, remoteJid, m);
+              } else {
+                await sendReply(remoteJid, replyText, m);
+              }
 
               if (remoteJid.includes("120363388633880584") || remoteJid === getCommunityGroupId()) {
                 recordCommunityGroupActivity(messageText, senderName, senderPhone).catch(() => {});
@@ -624,7 +747,17 @@ async function startBaileysGateway() {
             isGroup: false,
           });
 
-          await sendReply(remoteJid, replyText, m);
+          const wantsVoiceReply =
+            lower.includes("pakai vn") ||
+            lower.includes("pakai suara") ||
+            lower.includes("balas vn") ||
+            lower.includes("kirim vn");
+
+          if (wantsVoiceReply) {
+            await generateAndSendVoiceNote(replyText, remoteJid, m);
+          } else {
+            await sendReply(remoteJid, replyText, m);
+          }
         }
       } catch (msgErr: any) {
         addLog(`❌ [BAILEYS-MSG-ERR] ${msgErr.message}`, "error");
@@ -943,6 +1076,18 @@ const healthServer = http.createServer(async (req, res) => {
           <li><b>Grup WhatsApp:</b> Balas saat di-mention (@bot) atau dipanggil namanya.</li>
           <li><b>Multimodal:</b> Menganalisis gambar, stiker, VN, dan video via Gemini AI.</li>
         </ul>
+        <div style="background: #182229; border: 1px solid #222e35; border-radius: 12px; padding: 14px; margin-bottom: 16px;">
+          <h4 style="color: #00a884; font-size: 13px; margin-bottom: 8px;">✨ Panduan Fitur Media & Generator:</h4>
+          <div style="display: grid; grid-template-columns: 1fr; gap: 6px; font-size: 12px; color: #d1d7db;">
+            <div>🎨 <b>Generate Gambar:</b> Ketik <code>/gambar [deskripsi]</code> (contoh: <code>/gambar masjid megah di senja hari</code>)</div>
+            <div>🎙️ <b>Generate Suara / VN:</b> Ketik <code>/vn [teks]</code> (contoh: <code>/vn assalamu'alaikum sahabat 43</code>)</div>
+            <div>📷 <b>Baca Gambar & OCR:</b> Kirim foto apa saja (baca struk Baitul Maal, baca teks foto, ulas poster desain)</div>
+            <div>🎧 <b>Baca Voice Note (VN):</b> Kirim pesan suara, bot akan mendengarkan, menulis transkrip, dan membalas</div>
+            <div>🎥 <b>Baca Video:</b> Kirim video / video bulat (PTV), bot akan menganalisis adegan & suara lalu merespons</div>
+            <div>🎭 <b>Baca Stiker:</b> Kirim stiker WhatsApp, bot paham ekspresi meme/karakter stiker tersebut!</div>
+          </div>
+        </div>
+
         <div style="background: #1f2c34; border-radius: 10px; padding: 12px; font-size: 13px;">
           <div><b>Device JID:</b> <span id="deviceJid">-</span></div>
           <div style="margin-top: 4px;"><b>Nama Bot:</b> <span id="botName">-</span></div>
