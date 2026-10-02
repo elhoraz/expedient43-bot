@@ -254,8 +254,24 @@ async function startBaileysGateway() {
       }
 
       if (isLoggedOut || isForbidden) {
-        addLog("❌ Akun terputus/logout dari WhatsApp. Perlu scan ulang.", "error");
+        addLog(`❌ Sesi WhatsApp terputus/logout (code: ${statusCode}). Membersihkan sesi lama dan membuat QR Code baru...`, "error");
         currentQrDataUrl = "";
+        gatewayStatus = "connecting";
+
+        try {
+          if (fs.existsSync(AUTH_FOLDER)) {
+            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+          }
+        } catch (_) {}
+
+        // Hapus cadangan sesi kedaluwarsa di Supabase Storage
+        try {
+          const supabase = createAdminClient();
+          supabase.storage.from("wa-session-backup").remove(["wa_session.gz"]).catch(() => {});
+        } catch (_) {}
+
+        // Restart Baileys dengan folder kosong agar QR Code baru langsung dipancarkan ke dashboard
+        setTimeout(() => startBaileysGateway(), 1500);
         return;
       }
 
@@ -695,7 +711,45 @@ const healthServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // 4. Web Dashboard Visual (Dark Mode Premium)
+  // 4. API Reset Sesi & Paksa Terbitkan QR Baru
+  if (url === "/api/reset" && req.method === "POST") {
+    addLog("🔄 Permintaan reset sesi WhatsApp manual diterima...", "warn");
+    try {
+      if (currentSock) {
+        try {
+          currentSock.ev.removeAllListeners("connection.update");
+          currentSock.ev.removeAllListeners("messages.upsert");
+          currentSock.ev.removeAllListeners("creds.update");
+          currentSock.ws?.close();
+        } catch (_) {}
+      }
+
+      currentQrDataUrl = "";
+      currentPairingCode = "";
+      activeUser = null;
+      gatewayStatus = "connecting";
+
+      if (fs.existsSync(AUTH_FOLDER)) {
+        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+      }
+
+      try {
+        const supabase = createAdminClient();
+        await supabase.storage.from("wa-session-backup").remove(["wa_session.gz"]);
+      } catch (_) {}
+
+      setTimeout(() => startBaileysGateway(), 1000);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, message: "Sesi WhatsApp berhasil dibersihkan. Memuat QR Code baru..." }));
+    } catch (err: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 5. Web Dashboard Visual (Dark Mode Premium)
   if (url === "/" || url === "/qr" || url === "/dashboard") {
     const html = `<!DOCTYPE html>
 <html lang="id">
@@ -870,8 +924,13 @@ const healthServer = http.createServer(async (req, res) => {
     </div>
 
     <div class="card">
-      <div id="statusBadge" class="status-badge status-connecting">
-        <span id="statusDot">●</span> <span id="statusText">Memeriksa status...</span>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+        <div id="statusBadge" class="status-badge status-connecting" style="margin-bottom: 0;">
+          <span id="statusDot">●</span> <span id="statusText">Memeriksa status...</span>
+        </div>
+        <button onclick="resetSession()" class="btn" style="background: #1f2c34; color: #a0aec0; border: 1px solid #2a3942; font-size: 12px; padding: 6px 14px;">
+          🔄 Reset Sesi / Scan QR Baru
+        </button>
       </div>
 
       <div id="connectedView" style="display: none;">
@@ -982,12 +1041,26 @@ const healthServer = http.createServer(async (req, res) => {
             pBox.textContent = data.currentPairingCode;
             pBox.style.display = "block";
           }
+        } else if (data.gatewayStatus === "disconnected") {
+          badge.classList.add("status-disconnected");
+          statusText.textContent = "TERPUTUS (401)";
+          connectedView.style.display = "none";
+          qrView.style.display = "none";
+          connectingView.style.display = "block";
+          const h3 = document.querySelector("#connectingView h3");
+          const p = document.querySelector("#connectingView p");
+          if (h3) h3.textContent = "Sesi Terputus dari WhatsApp (401)";
+          if (p) p.textContent = "Sesi lama kedaluwarsa. Sistem sedang membersihkan cache dan memuat QR Code baru secara otomatis...";
         } else {
           badge.classList.add("status-connecting");
           statusText.textContent = "MENYAMBUNGKAN...";
           connectedView.style.display = "none";
           qrView.style.display = "none";
           connectingView.style.display = "block";
+          const h3 = document.querySelector("#connectingView h3");
+          const p = document.querySelector("#connectingView p");
+          if (h3) h3.textContent = "Sedang Menghubungkan ke WhatsApp...";
+          if (p) p.textContent = "Menunggu handshake socket & pemulihan sesi cloud.";
         }
 
         // Render Logs
@@ -1037,6 +1110,18 @@ const healthServer = http.createServer(async (req, res) => {
       } finally {
         btn.disabled = false;
         btn.textContent = "Minta Kode";
+      }
+    }
+
+    async function resetSession() {
+      if (!confirm("Reset sesi WhatsApp dan buat QR Code baru sekarang?")) return;
+      try {
+        const res = await fetch("/api/reset", { method: "POST" });
+        const data = await res.json();
+        alert(data.message || "Sesi sedang dibersihkan...");
+        fetchStatus();
+      } catch (e) {
+        alert("Gagal reset: " + e.message);
       }
     }
 
