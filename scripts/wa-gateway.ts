@@ -163,10 +163,11 @@ async function startBaileysGateway() {
 
   // Helper pengiriman pesan yang aman & tahan banting
   const sendReply = async (targetJid: string, text: string, quotedMessage?: any) => {
+    const cleanJid = targetJid.replace(/:\d+@/, "@");
     try {
       const res = quotedMessage
-        ? await sock.sendMessage(targetJid, { text }, { quoted: quotedMessage })
-        : await sock.sendMessage(targetJid, { text });
+        ? await sock.sendMessage(cleanJid, { text }, { quoted: quotedMessage })
+        : await sock.sendMessage(cleanJid, { text });
       if (res?.key?.id) {
         sentMessageIds.add(res.key.id);
         if (sentMessageIds.size > 2000) {
@@ -174,16 +175,16 @@ async function startBaileysGateway() {
           if (first) sentMessageIds.delete(first);
         }
       }
-      addLog(`📤 [REPLY-SUCCESS] Terkirim ke ${targetJid}: "${text.slice(0, 50).replace(/\n/g, " ")}..."`, "success");
+      addLog(`📤 [REPLY-SUCCESS] Terkirim ke ${cleanJid}: "${text.slice(0, 50).replace(/\n/g, " ")}..."`, "success");
       return res;
     } catch (err: any) {
-      addLog(`⚠️ [SEND-FALLBACK] Mengirim tanpa quote ke ${targetJid}: ${err.message}`, "warn");
+      addLog(`⚠️ [SEND-FALLBACK] Mengirim tanpa quote ke ${cleanJid}: ${err.message}`, "warn");
       try {
-        const res = await sock.sendMessage(targetJid, { text });
+        const res = await sock.sendMessage(cleanJid, { text });
         if (res?.key?.id) sentMessageIds.add(res.key.id);
         return res;
       } catch (err2: any) {
-        addLog(`❌ [SEND-FAILED] Gagal kirim pesan ke ${targetJid}: ${err2.message}`, "error");
+        addLog(`❌ [SEND-FAILED] Gagal kirim pesan ke ${cleanJid}: ${err2.message}`, "error");
         return null;
       }
     }
@@ -191,9 +192,10 @@ async function startBaileysGateway() {
 
   // Helper Generate & Kirim Gambar AI (Pollinations Flux AI - 100% Gratis & Berkualitas Tinggi)
   const generateAndSendImage = async (prompt: string, targetJid: string, quotedMessage?: any) => {
+    const cleanJid = targetJid.replace(/:\d+@/, "@");
     try {
       addLog(`🎨 [GENERATE-IMAGE] Membuat gambar untuk: "${prompt}"...`);
-      await sock.sendPresenceUpdate("composing", targetJid).catch(() => {});
+      await sock.sendPresenceUpdate("composing", cleanJid).catch(() => {});
       const encodedPrompt = encodeURIComponent(prompt.trim());
       const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&model=flux&nologo=true&seed=${Math.floor(Math.random() * 1000000)}`;
 
@@ -201,28 +203,30 @@ async function startBaileysGateway() {
       if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
       const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
 
-      await sock.sendMessage(
-        targetJid,
+      const res = await sock.sendMessage(
+        cleanJid,
         {
           image: imgBuffer,
           caption: `🎨 *Hasil Gambar AI (Flux):*\n"${prompt}"\n\n_Dibuat otomatis oleh Expedient 43 AI Companion_`,
         },
         { quoted: quotedMessage }
       );
-      addLog(`📤 [IMAGE-SENT] Berhasil mengirim gambar ke ${targetJid}`, "success");
+      if (res?.key?.id) sentMessageIds.add(res.key.id);
+      addLog(`📤 [IMAGE-SENT] Berhasil mengirim gambar ke ${cleanJid}`, "success");
       return true;
     } catch (err: any) {
       addLog(`❌ [GENERATE-IMAGE-ERR] ${err.message}`, "error");
-      await sendReply(targetJid, `Maaf Sahabat, pembuatan gambar sedang sibuk (${err.message}). Silakan coba lagi ya!`, quotedMessage);
+      await sendReply(cleanJid, `Maaf Sahabat, pembuatan gambar sedang sibuk (${err.message}). Silakan coba lagi ya!`, quotedMessage);
       return false;
     }
   };
 
   // Helper Generate & Kirim Voice Note / Suara (Google Text-to-Speech & WhatsApp PTT Audio)
   const generateAndSendVoiceNote = async (text: string, targetJid: string, quotedMessage?: any) => {
+    const cleanJid = targetJid.replace(/:\d+@/, "@");
     try {
       addLog(`🎙️ [GENERATE-VOICE] Mengonversi teks ke rekaman suara: "${text.slice(0, 45)}..."`);
-      await sock.sendPresenceUpdate("recording", targetJid).catch(() => {});
+      await sock.sendPresenceUpdate("recording", cleanJid).catch(() => {});
 
       // Bersihkan teks dari format markdown/bintang agar intonasi suara jernih
       const cleanText = text.replace(/[*_~`]/g, "").slice(0, 250).trim();
@@ -235,8 +239,8 @@ async function startBaileysGateway() {
       if (!ttsRes.ok) throw new Error(`HTTP ${ttsRes.status}`);
       const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());
 
-      await sock.sendMessage(
-        targetJid,
+      const res = await sock.sendMessage(
+        cleanJid,
         {
           audio: audioBuffer,
           mimetype: "audio/mp4",
@@ -244,11 +248,12 @@ async function startBaileysGateway() {
         },
         { quoted: quotedMessage }
       );
-      addLog(`📤 [VOICE-SENT] Berhasil mengirim Voice Note ke ${targetJid}`, "success");
+      if (res?.key?.id) sentMessageIds.add(res.key.id);
+      addLog(`📤 [VOICE-SENT] Berhasil mengirim Voice Note ke ${cleanJid}`, "success");
       return true;
     } catch (err: any) {
       addLog(`❌ [GENERATE-VOICE-ERR] ${err.message}`, "error");
-      await sendReply(targetJid, `Maaf Sahabat, konversi suara belum dapat dikirimkan (${err.message}).`, quotedMessage);
+      await sendReply(cleanJid, `Maaf Sahabat, konversi suara belum dapat dikirimkan (${err.message}).`, quotedMessage);
       return false;
     }
   };
@@ -371,7 +376,8 @@ async function startBaileysGateway() {
   // LISTENER PESAN MASUK (MESSAGES.UPSERT)
   // ===========================================================================
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
+    // Tangani baik 'notify' (pesan baru dari orang lain) maupun 'append' (pesan dari HP bot / self-chat / saat WA sedang dibuka)
+    if (type !== "notify" && type !== "append") return;
 
     for (const m of messages) {
       try {
@@ -382,6 +388,13 @@ async function startBaileysGateway() {
 
         const remoteJid = m.key.remoteJid || "";
         if (!m.message || remoteJid === "status@broadcast") continue;
+
+        // Cegah eksekusi ulang pesan lama dari sinkronisasi riwayat (> 120 detik)
+        const msgTimestamp = Number(m.messageTimestamp || 0);
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (msgTimestamp && nowSec - msgTimestamp > 120) {
+          continue;
+        }
 
         if (msgId && m.message) {
           msgStore.set(msgId, m.message);
@@ -398,24 +411,23 @@ async function startBaileysGateway() {
 
         const botPhone = (sock.user?.id?.split(":")[0] || pairingPhoneArg || process.env.WA_BOT_PHONE || "6285151771289").replace(/\D/g, "");
         const botShortPhone = botPhone.slice(-9);
-        const botLid = sock.user?.lid ? sock.user.lid.split(":")[0] : "";
-        const botUserId = sock.user?.id ? sock.user.id.split(":")[0] : "";
+        const botLid = sock.user?.lid ? sock.user.lid.split(":")[0].replace(/\D/g, "") : "";
+        const botUserId = sock.user?.id ? sock.user.id.split(":")[0].replace(/\D/g, "") : "";
+        const cleanRemote = remoteJid.replace(/:\d+@/, "@").replace(/\D/g, "");
 
-        // Deteksi chat ke diri sendiri
+        // Deteksi chat ke nomor sendiri (Self-Chat / Catatan ke diri sendiri / Message Yourself)
         const isSelfChat = !isGroup && (
-          remoteJid.includes(botShortPhone) ||
-          remoteJid.includes(botPhone) ||
-          (botLid && remoteJid.includes(botLid)) ||
-          (botUserId && remoteJid.includes(botUserId))
+          cleanRemote.includes(botShortPhone) ||
+          cleanRemote.includes(botPhone) ||
+          (botLid && cleanRemote.includes(botLid)) ||
+          (botUserId && cleanRemote.includes(botUserId)) ||
+          (m.key.participant && m.key.participant === remoteJid) ||
+          (sock.user?.id && remoteJid.includes(sock.user.id.split(":")[0])) ||
+          (sock.user?.lid && remoteJid.includes(sock.user.lid.split(":")[0]))
         );
 
         if (isSelfChat) {
           senderPhone = botPhone;
-        }
-
-        // Jangan proses pesan yang dikirim bot sendiri kecuali pesan ke diri sendiri
-        if (m.key.fromMe && !isSelfChat) {
-          continue;
         }
 
         const rawMsg = m.message;
@@ -427,9 +439,32 @@ async function startBaileysGateway() {
           msgContent.imageMessage?.caption ||
           msgContent.videoMessage?.caption ||
           msgContent.documentMessage?.caption ||
+          msgContent.buttonsResponseMessage?.selectedDisplayText ||
+          msgContent.templateButtonReplyMessage?.selectedId ||
+          msgContent.listResponseMessage?.title ||
           msgContent.editedMessage?.message?.protocolMessage?.editedMessage?.conversation ||
           msgContent.editedMessage?.message?.protocolMessage?.editedMessage?.extendedTextMessage?.text ||
           "";
+
+        const lower = messageText.trim().toLowerCase();
+
+        // Deteksi apakah pesan yang dikirim dari HP bot adalah perintah pengujian dari pemilik bot
+        const isOwnerCommand =
+          lower.startsWith("/") ||
+          lower.startsWith("!") ||
+          lower.startsWith("bot ") ||
+          lower.startsWith("min ") ||
+          lower === "ping" ||
+          lower === "tes" ||
+          lower === "halo" ||
+          lower === "p";
+
+        // Jangan proses pesan yang dikirim bot sendiri KECUALI:
+        // 1. Pesan ke diri sendiri (isSelfChat)
+        // 2. Perintah tes dari pemilik bot (isOwnerCommand)
+        if (m.key.fromMe && !isSelfChat && !isOwnerCommand) {
+          continue;
+        }
 
         const contextInfo =
           msgContent.extendedTextMessage?.contextInfo ||
@@ -625,8 +660,6 @@ async function startBaileysGateway() {
 
         // 3. PENANGANAN PESAN TEKS & EMOJI
         if (!messageText) continue;
-
-        const lower = messageText.trim().toLowerCase();
 
         // =====================================================================
         // FITUR AI GENERATOR: GAMBAR (Flux AI) & SUARA (Voice Note / VN)
