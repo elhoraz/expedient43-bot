@@ -190,33 +190,140 @@ async function startBaileysGateway() {
     }
   };
 
-  // Helper Generate & Kirim Gambar AI (Pollinations Flux AI - 100% Gratis & Berkualitas Tinggi)
-  const generateAndSendImage = async (prompt: string, targetJid: string, quotedMessage?: any) => {
+  // Helper Generate & Kirim Poster / Gambar AI & Aset Resmi HD
+  const generateAndSendImage = async (rawPrompt: string, targetJid: string, quotedMessage?: any) => {
     const cleanJid = targetJid.replace(/:\d+@/, "@");
-    try {
-      addLog(`🎨 [GENERATE-IMAGE] Membuat gambar untuk: "${prompt}"...`);
-      await sock.sendPresenceUpdate("composing", cleanJid).catch(() => {});
-      const encodedPrompt = encodeURIComponent(prompt.trim());
-      const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&model=flux&nologo=true&seed=${Math.floor(Math.random() * 1000000)}`;
+    const lowerPrompt = rawPrompt.toLowerCase().trim();
 
-      const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(45000) });
-      if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
-      const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+    // 1. CEK ASET POSTER RESMI EXPEDIENT DARI DISK SERVER
+    // Jika meminta agenda resmi (HUT TNI, Kesaktian Pancasila, G30S PKI, dll)
+    const isHutTni = lowerPrompt.includes("tni") || lowerPrompt.includes("tentara");
+    const isPancasila = lowerPrompt.includes("pancasila") || lowerPrompt.includes("kesaktian");
+    const isG30s = lowerPrompt.includes("g30s") || lowerPrompt.includes("pki");
+
+    const possiblePosterPaths = [
+      path.join(process.cwd(), "public", "images", "posters"),
+      path.join(__dirname, "..", "public", "images", "posters"),
+      path.join(__dirname, "public", "images", "posters"),
+      "/opt/render/project/src/public/images/posters",
+    ];
+
+    const findPosterBuffer = async (filename: string): Promise<Buffer | null> => {
+      for (const p of possiblePosterPaths) {
+        const full = path.join(p, filename);
+        if (fs.existsSync(full)) {
+          try {
+            return fs.readFileSync(full);
+          } catch (_) {}
+        }
+      }
+      // Fallback: Unduh langsung dari Supabase Storage CDN yang selalu aktif & 100% online
+      try {
+        const cdnUrl = `https://dodcwulqgrhqpbldrlik.supabase.co/storage/v1/object/public/cms-assets/posters/${filename}`;
+        const res = await fetch(cdnUrl, { signal: AbortSignal.timeout(15000) });
+        if (res.ok) {
+          const ab = await res.arrayBuffer();
+          if (ab.byteLength > 1000) {
+            return Buffer.from(ab);
+          }
+        }
+      } catch (_) {}
+      return null;
+    };
+
+    let officialBuffer: Buffer | null = null;
+    let officialTitle = "";
+
+    if (isHutTni) {
+      officialBuffer = (await findPosterBuffer("hut_tni_feed.jpg")) || (await findPosterBuffer("hut_tni_story.jpg"));
+      officialTitle = "HUT TNI (5 Oktober 2026)";
+    } else if (isPancasila) {
+      officialBuffer = (await findPosterBuffer("kesaktian_pancasila_feed.jpg")) || (await findPosterBuffer("kesaktian_pancasila_story.jpg"));
+      officialTitle = "Hari Kesaktian Pancasila (1 Oktober)";
+    } else if (isG30s) {
+      officialBuffer = (await findPosterBuffer("g30s_pki_feed.jpg")) || (await findPosterBuffer("g30s_pki_story.jpg"));
+      officialTitle = "Peringatan G30S/PKI (30 September)";
+    }
+
+    if (officialBuffer) {
+      addLog(`🖼️ [OFFICIAL-POSTER] Mengirimkan poster resmi siap pakai: "${officialTitle}" ke ${cleanJid}`);
+      await sock.sendPresenceUpdate("composing", cleanJid).catch(() => {});
+      const caption =
+        `🎨 *DESAIN POSTER RESMI EXPEDIENT 43 (SIAP PUBLISH)* 🖼️\n\n` +
+        `📌 *Agenda:* ${officialTitle}\n` +
+        `✨ *Kualitas:* Ultra HD 1080p (Feed & Story Ready)\n` +
+        `🏢 *Studio:* Expedient Creative Graphic Design\n\n` +
+        `_Desain resmi sudah siap pakai & tinggal diunggah ke media sosial alumni!_ 🚀✨`;
 
       const res = await sock.sendMessage(
         cleanJid,
         {
-          image: imgBuffer,
-          caption: `🎨 *Hasil Gambar AI (Flux):*\n"${prompt}"\n\n_Dibuat otomatis oleh Expedient 43 AI Companion_`,
+          image: officialBuffer,
+          caption,
         },
         { quoted: quotedMessage }
       );
       if (res?.key?.id) sentMessageIds.add(res.key.id);
-      addLog(`📤 [IMAGE-SENT] Berhasil mengirim gambar ke ${cleanJid}`, "success");
+      addLog(`📤 [POSTER-SENT] Poster resmi ${officialTitle} berhasil dikirim!`, "success");
       return true;
+    }
+
+    // 2. PEMBUATAN GAMBAR / POSTER AI ON-DEMAND (POLLINATIONS AI)
+    try {
+      addLog(`🎨 [GENERATE-IMAGE] Merancang & membuat gambar AI untuk: "${rawPrompt}"...`);
+      await sock.sendPresenceUpdate("composing", cleanJid).catch(() => {});
+
+      const encodedPrompt = encodeURIComponent(rawPrompt.trim());
+      const pollKey = process.env.POLLINATIONS_API_KEY ? `&key=${process.env.POLLINATIONS_API_KEY}` : "";
+
+      const candidateUrls = [
+        `https://gen.pollinations.ai/image/${encodedPrompt}?width=512&height=768&nologo=true${pollKey}`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?width=512&height=768&nologo=true`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?width=512&height=512&nologo=true`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?nologo=true`,
+      ];
+
+      let imgBuffer: Buffer | null = null;
+      for (const url of candidateUrls) {
+        try {
+          const imgRes = await fetch(url, { signal: AbortSignal.timeout(30000) });
+          if (imgRes.ok) {
+            const buf = Buffer.from(await imgRes.arrayBuffer());
+            if (buf.byteLength > 1000) {
+              imgBuffer = buf;
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (imgBuffer) {
+        const res = await sock.sendMessage(
+          cleanJid,
+          {
+            image: imgBuffer,
+            caption:
+              `🎨 *HASIL DESAIN POSTER / GAMBAR AI* 🖼️\n\n` +
+              `📌 *Konsep:* "${rawPrompt}"\n` +
+              `✨ *Studio:* Expedient Generation 43 AI Studio\n\n` +
+              `_Dibuat otomatis sebagai draf & referensi tim desainer!_`,
+          },
+          { quoted: quotedMessage }
+        );
+        if (res?.key?.id) sentMessageIds.add(res.key.id);
+        addLog(`📤 [IMAGE-SENT] Berhasil mengirim gambar AI ke ${cleanJid}`, "success");
+        return true;
+      }
+
+      throw new Error("Layanan render gambar AI sedang padat");
     } catch (err: any) {
       addLog(`❌ [GENERATE-IMAGE-ERR] ${err.message}`, "error");
-      await sendReply(cleanJid, `Maaf Sahabat, pembuatan gambar sedang sibuk (${err.message}). Silakan coba lagi ya!`, quotedMessage);
+      await sendReply(
+        cleanJid,
+        `Maaf Sahabat desainer, server rendering AI sedang antre (${err.message}). ` +
+        `Untuk agenda resmi (seperti *HUT TNI*, *Kesaktian Pancasila*, dan *Milad*), poster HD siap pakai sudah tersedia di galeri studio kita! 🎨🚀`,
+        quotedMessage
+      );
       return false;
     }
   };
@@ -661,28 +768,78 @@ async function startBaileysGateway() {
         // 3. PENANGANAN PESAN TEKS & EMOJI
         if (!messageText) continue;
 
-        // =====================================================================
-        // FITUR AI GENERATOR: GAMBAR (Flux AI) & SUARA (Voice Note / VN)
-        // =====================================================================
-        const isImageGenRequest =
-          lower.startsWith("/gambar ") ||
-          lower.startsWith("!gambar ") ||
-          lower.startsWith("/image ") ||
-          lower.startsWith("!image ") ||
-          lower.startsWith("/draw ") ||
-          lower.startsWith("!draw ") ||
-          lower.startsWith("buatkan gambar ") ||
-          lower.startsWith("bikin gambar ") ||
-          lower.startsWith("generate gambar ") ||
-          lower.startsWith("lukiskan ") ||
-          lower.startsWith("gambarin ");
+        // Bersihkan mention bot (@105240321908772, @85151771289, @bot, dll) untuk deteksi perintah
+        const cleanTextWithoutMention = messageText
+          .replace(/@\d+/g, "")
+          .replace(/@(bot|min|admin|expedient)/gi, "")
+          .trim();
+        const cleanLower = cleanTextWithoutMention.toLowerCase();
 
-        if (isImageGenRequest && (isGroup ? isDirectlyAddressed || shouldGroupBotRespond(messageText) : true)) {
-          const prompt = messageText
-            .replace(/^(\/gambar|!gambar|\/image|!image|\/draw|!draw|buatkan gambar|bikin gambar|generate gambar|lukiskan|gambarin)\s+/i, "")
+        // =====================================================================
+        // FITUR AI GENERATOR: GAMBAR / POSTER & SUARA (Voice Note / VN)
+        // =====================================================================
+        const isPosterOrImageRequest =
+          // Perintah Prefix
+          cleanLower.startsWith("/gambar") ||
+          cleanLower.startsWith("!gambar") ||
+          cleanLower.startsWith("/image") ||
+          cleanLower.startsWith("!image") ||
+          cleanLower.startsWith("/draw") ||
+          cleanLower.startsWith("!draw") ||
+          cleanLower.startsWith("/poster") ||
+          cleanLower.startsWith("!poster") ||
+          cleanLower.startsWith("/desain") ||
+          cleanLower.startsWith("!desain") ||
+          cleanLower.startsWith("/design") ||
+          cleanLower.startsWith("!design") ||
+          cleanLower.startsWith("/flyer") ||
+          cleanLower.startsWith("/banner") ||
+          // Kalimat Aksi Pembuatan Poster / Desain
+          cleanLower.includes("buatkan poster") ||
+          cleanLower.includes("bikin poster") ||
+          cleanLower.includes("buat poster") ||
+          cleanLower.includes("bikinin poster") ||
+          cleanLower.includes("buatkan desain") ||
+          cleanLower.includes("bikin desain") ||
+          cleanLower.includes("buat desain") ||
+          cleanLower.includes("bikinin desain") ||
+          cleanLower.includes("buatkan design") ||
+          cleanLower.includes("bikin design") ||
+          cleanLower.includes("buatkan gambar") ||
+          cleanLower.includes("bikin gambar") ||
+          cleanLower.includes("generate gambar") ||
+          cleanLower.includes("generate poster") ||
+          cleanLower.includes("generate desain") ||
+          cleanLower.includes("desainkan") ||
+          cleanLower.includes("designkan") ||
+          cleanLower.includes("lukiskan") ||
+          cleanLower.includes("gambarin") ||
+          cleanLower.includes("kamu buatin") ||
+          // Permintaan melihat / mengecek poster di Grup Desain atau saat bot di-tag
+          ((isDesignGroupId(remoteJid) || isDirectlyAddressed) && (
+            cleanLower.includes("mana poster") ||
+            cleanLower.includes("lihat poster") ||
+            cleanLower.includes("kirim poster") ||
+            cleanLower.includes("draf poster") ||
+            cleanLower === "mana liat" ||
+            cleanLower === "mana lihat" ||
+            cleanLower === "mana drafnya"
+          ));
+
+        if (isPosterOrImageRequest && (isGroup ? isDirectlyAddressed || isDesignGroupId(remoteJid) || shouldGroupBotRespond(messageText) : true)) {
+          let prompt = cleanTextWithoutMention
+            .replace(/^(\/gambar|\!gambar|\/image|\!image|\/draw|\!draw|\/poster|\!poster|\/desain|\!desain|\/design|\!design|\/flyer|\/banner)\s*/i, "")
+            .replace(/^(tolong\s+)?(buatkan|bikin|bikinin|buat|generate|desainkan|designkan|lukiskan|gambarin|kamu buatin)\s+(poster|desain|design|flyer|banner|gambar)?\s*(untuk|tentang|tema)?\s*/i, "")
+            .replace(/^(mana|lihat|kirim)\s+(poster|desain|draf)?\s*(untuk|tentang|tema)?\s*/i, "")
             .trim();
+
+          // Jika teks prompt masih kosong atau pengguna hanya bilang "mana liat" / "kamu buatin", default ke agenda HUT TNI
+          if (!prompt || prompt.toLowerCase() === "mana liat" || prompt.toLowerCase() === "kamu buatin") {
+            prompt = "HUT TNI";
+          }
+
           if (prompt) {
-            await sendReply(remoteJid, `🎨 Sedang melukis gambar *"${prompt}"*... Tunggu sebentar ya Sahabat! ⏳`, m);
+            await sendReply(remoteJid, `🎨 Sedang menyiapkan & merancang desain poster *"${prompt}"*... Tunggu sebentar ya Sahabat desainer! ⏳✨`, m);
             await generateAndSendImage(prompt, remoteJid, m);
             continue;
           }
