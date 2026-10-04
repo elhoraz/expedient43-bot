@@ -316,8 +316,11 @@ async function startBaileysGateway() {
       if (blueprint.pinterest_dna) {
         const p = blueprint.pinterest_dna;
         blueprintText +=
-          `\n📌 *PINTEREST VISUAL RESEARCH*\n` +
+          `\n📌 *PINTEREST & BEHANCE DESIGN RESEARCH*\n` +
           `  • *Aesthetic Style:* ${p.pinterestStyleTitle}\n` +
+          `  • *Trending Font Pairing:* ${p.typographyDNA?.trendingFontPairing || "Cinzel / Cormorant + Plus Jakarta Sans"}\n` +
+          `  • *Designer Typography Stack:* ${p.typographyDNA?.headlineFont?.split(",")[0] || "Cinzel"} + ${p.typographyDNA?.subheadlineFont?.split(",")[0] || "Plus Jakarta Sans"}\n` +
+          `  • *Typographic Treatment:* ${p.typographyDNA?.treatment || "Generous tracking & hairline rules"}\n` +
           `  • *Visual Mood:* ${p.trendingKeywords.slice(0, 3).join(", ")}\n` +
           `  • *Research Engine:* ${p.source === "LIVE_PINTEREST_SEARCH" ? "Live Pinterest Search 🔍" : "Curated Board 📌"}\n`;
       }
