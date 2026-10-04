@@ -313,6 +313,14 @@ async function startBaileysGateway() {
         `4️⃣ *Instant Delivery:* Mengirimkan poster siap posting langsung ke WhatsApp!\n\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
       let blueprintText = procedureHeader + formatBlueprintForWhatsApp(blueprint);
+      if (blueprint.pinterest_dna) {
+        const p = blueprint.pinterest_dna;
+        blueprintText +=
+          `\n📌 *PINTEREST VISUAL RESEARCH*\n` +
+          `  • *Aesthetic Style:* ${p.pinterestStyleTitle}\n` +
+          `  • *Visual Mood:* ${p.trendingKeywords.slice(0, 3).join(", ")}\n` +
+          `  • *Research Engine:* ${p.source === "LIVE_PINTEREST_SEARCH" ? "Live Pinterest Search 🔍" : "Curated Board 📌"}\n`;
+      }
       if (qualityReport?.intelligence) {
         const intel = qualityReport.intelligence;
         blueprintText +=
