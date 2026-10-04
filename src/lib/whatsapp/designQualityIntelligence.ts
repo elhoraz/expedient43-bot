@@ -32,6 +32,7 @@ import {
   AuthenticityValidationResult,
   TypographyCriticAIReport,
   StudioQualityGateV3Result,
+  WatermarkDetectionResult,
 } from "./typographyLayoutEngineV3";
 import {
   ThemeLockEngine,
@@ -86,6 +87,34 @@ export const THEME_KNOWLEDGE_PACKS_V2: Record<string, ThemeKnowledgePack> = {
       secondary: ["#1C1917", "#FDFBF7"],
     },
     defaultMood: "Intellectual, graceful, noble, and historically profound",
+  },
+  hari_ibu: {
+    id: "hari_ibu",
+    name: "Hari Ibu Nasional (22 Desember)",
+    themeKeywords: ["ibu", "hari ibu", "mother", "mothers day", "kasih ibu", "bunda", "mama", "ummi", "22 desember"],
+    pillars: [
+      "Unconditional maternal devotion and selfless sacrifice (Kasih Ibu Sepanjang Masa)",
+      "Warmth of maternal embrace and noble sanctuary of family",
+      "Elegance, tenderness, and enduring grace of motherhood",
+      "Gratitude, veneration, and prayers for heaven at mother's feet",
+    ],
+    authenticSymbols: [
+      "Tender silhouette of an Indonesian mother holding her child in warm soft golden morning light",
+      "Delicate blooming blush carnations, jasmine, and white lilies with subtle golden dew",
+      "Elegantly draped soft silk scarf in warm rose and ivory tones catching gentle morning breeze",
+      "Warm minimalist sanctuary interior with morning sunlight streaming through sheer curtains",
+    ],
+    avoidClichés: [
+      "Cheesy cartoon clip-art",
+      "Loud neon colors or aggressive graphics",
+      "Commercial supermarket sale flyers",
+    ],
+    culturalContext: "Commemoration of Indonesian Women's Congress 1928 and profound heartfelt tribute to mothers nationwide",
+    recommendedPalette: {
+      primary: ["#9F1239", "#E0A96D"],
+      secondary: ["#FFF1F2", "#1C1917"],
+    },
+    defaultMood: "Tender, warm, deeply emotional, elegant, and heartfelt",
   },
   independence_day: {
     id: "independence_day",

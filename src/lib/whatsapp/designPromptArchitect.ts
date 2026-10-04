@@ -21,6 +21,7 @@ import {
   escapeXml,
   wrapSvgText,
   calculateHeadlineSize,
+  formatSvgHeadlineTspans,
 } from "./designSystem";
 import { ThemeLockEngine } from "./themeLockEngine";
 import { PinterestResearchEngine, type PinterestAestheticDNA } from "./pinterestResearchEngine";
@@ -701,6 +702,22 @@ function createFallbackBrief(
     headline = "CHAMPIONSHIP";
     subheadline = "Semangat Juara, Kejayaan Bersama";
     quote = "Raih prestasi tertinggi dengan sportivitas.";
+  } else if (lower.includes("ibu") || lower.includes("mother") || lower.includes("bunda") || lower.includes("mama")) {
+    category = "COMMEMORATIVE_POSTER";
+    presetId = "02_EDITORIAL_LUXURY";
+    creativeStyle = "LUXURY_EDITORIAL";
+    headline = "SELAMAT HARI IBU";
+    subheadline = "Kasih Ibu Sepanjang Masa, Doa Tiada Akhir";
+    quote = "Surga di bawah telapak kaki ibu, pelindung hati selamanya.";
+    eyebrow = "♡ 22 DESEMBER · HARI IBU NASIONAL ♡";
+  } else if (lower.includes("kartini") || lower.includes("emansipasi") || lower.includes("wanita") || lower.includes("perempuan")) {
+    category = "COMMEMORATIVE_POSTER";
+    presetId = "02_EDITORIAL_LUXURY";
+    creativeStyle = "LUXURY_EDITORIAL";
+    headline = "HARI KARTINI";
+    subheadline = "Habis Gelap Terbitlah Terang";
+    quote = "Perempuan berdaya, bangsa berjaya menggapai cita.";
+    eyebrow = "★ 21 APRIL · PERINGATAN NASIONAL ★";
   }
 
   const preset = DESIGN_PRESETS[presetId];

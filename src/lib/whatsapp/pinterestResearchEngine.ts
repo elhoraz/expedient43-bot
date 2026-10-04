@@ -85,6 +85,25 @@ const CURATED_PINTEREST_FALLBACKS: Record<string, {
       microAccents: "✦  ✦  ✦"
     }
   },
+  hari_ibu: {
+    pinterestStyleTitle: "Soft Luxury Rose & Tender Floral Editorial",
+    trendingKeywords: ["tender maternal portrait", "blush rose gold", "delicate carnation floral", "kinfolk luxury editorial", "playfair display serif"],
+    colorPalette: {
+      primary: ["#9F1239", "#E0A96D"],
+      accents: ["#FFF1F2", "#1C1917", "#D4AF37"]
+    },
+    compositionDNA: "Graceful silhouette of Indonesian mother embracing her child with tender love, framed by soft blush botanicals and airy bottom 35% negative space",
+    lightingDNA: "Warm golden morning sunlight through sheer white linen curtains, soft emotional bloom and subtle film grain",
+    injectedPromptEnrichment: "aesthetic Pinterest poster, Kinfolk editorial magazine, tender maternal love, graceful Indonesian mother gently embracing child, blush rose and warm gold tones, soft morning sunlight, delicate carnation florals, Behance featured, 8k resolution",
+    typographyDNA: {
+      trendingFontPairing: "Playfair Display + Plus Jakarta Sans (Maternal Elegance Trend)",
+      headlineFont: "'Playfair Display', 'Cormorant Garamond', serif",
+      subheadlineFont: "'Plus Jakarta Sans', 'Inter', sans-serif",
+      headlineTracking: 5,
+      treatment: "Frameless floating luxury bottom typography, warm rose hairline rule, heartfelt elegance",
+      microAccents: "♡  KASIH IBU  ♡"
+    }
+  },
   kemerdekaan: {
     pinterestStyleTitle: "Modern Swiss Monumental & Minimalist Red-White",
     trendingKeywords: ["modern swiss grid", "geometric red-white", "bold editorial typography", "silk flutter", "ultra-minimalist"],
@@ -300,6 +319,8 @@ export class PinterestResearchEngine {
     let fallbackKey = "default";
     if (/tahun baru islam|1 muharram|muharram|hijriah|hijriyah|tahun baru hijriah/i.test(lower)) {
       fallbackKey = "tahun_baru_islam";
+    } else if (/ibu|mother|hari ibu|bunda|mama|ummi/i.test(lower)) {
+      fallbackKey = "hari_ibu";
     } else if (/kartini|wanita|perempuan|emansipasi/i.test(lower)) {
       fallbackKey = "kartini";
     } else if (/kemerdekaan|17 agustus|ri|merdeka|proklamasi/i.test(lower)) {
