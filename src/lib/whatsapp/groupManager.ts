@@ -350,7 +350,10 @@ export async function rejectPendingBroadcast(
 /**
  * Filter Cerdas: Memeriksa apakah bot harus merespons di dalam grup WhatsApp bebas
  */
-export function shouldGroupBotRespond(messageText: string): boolean {
+export function shouldGroupBotRespond(messageText: string, isQuotedFromBot = false): boolean {
+  if (isQuotedFromBot) {
+    return true;
+  }
   if (!messageText) return false;
   const lower = messageText.trim().toLowerCase();
 
@@ -398,7 +401,35 @@ export function shouldGroupBotRespond(messageText: string): boolean {
     return true;
   }
 
-  // 4. Pertanyaan Faktual Terarah, Permintaan Pembuatan Stiker, Suara / VN, & Poster / Desain
+  // 4. Filter Anti-Spam: Cegah bot nimbrung ucapan selamat ulang tahun / milad santai antar sesama anggota!
+  const isCasualBirthdayGreeting =
+    lower.includes("selamat ulang tahun") ||
+    lower.includes("selamat milad") ||
+    lower.includes("barakallah") ||
+    lower.includes("mabruk") ||
+    lower.includes("hbd") ||
+    lower.includes("met ultah") ||
+    lower.includes("traktir") ||
+    lower.includes("lagi ultah") ||
+    lower.includes("ultah ke") ||
+    lower.includes("milad ke");
+
+  if (isCasualBirthdayGreeting && !isQuotedFromBot) {
+    const hasExplicitBotCall =
+      messageText.startsWith("!") ||
+      messageText.startsWith("/") ||
+      lower.includes("@bot") ||
+      lower.includes("@min") ||
+      lower.includes("@admin") ||
+      lower.startsWith("bot ") ||
+      lower.startsWith("min ");
+
+    if (!hasExplicitBotCall) {
+      return false;
+    }
+  }
+
+  // 5. Pertanyaan Faktual Terarah, Permintaan Pembuatan Stiker, Suara / VN, & Poster / Desain
   if (
     lower.startsWith("siapa ") ||
     lower.startsWith("siapakah ") ||
@@ -431,12 +462,19 @@ export function shouldGroupBotRespond(messageText: string): boolean {
     lower.includes("kuis") ||
     lower.includes("tebak santri") ||
     lower.includes("leaderboard") ||
-    lower.includes("milad") ||
-    lower.includes("ultah") ||
-    lower.includes("ulang tahun") ||
+    // Pertanyaan eksplisit agenda/siapa yang milad atau ultah (BUKAN ucapan selamat)
+    ((lower.includes("siapa") || lower.includes("kapan") || lower.includes("info") || lower.includes("jadwal") || lower.includes("daftar")) &&
+      (lower.includes("ultah") || lower.includes("milad") || lower.includes("ulang tahun"))) ||
     lower.includes("mahfudzot") ||
     lower.includes("hadits") ||
-    lower.includes("sunnah jumat")
+    lower.includes("sunnah jumat") ||
+    lower.includes("kesimpulan") ||
+    lower.includes("rangkum") ||
+    lower.includes("rekap") ||
+    lower.includes("apa yang diomongin") ||
+    lower.includes("apa yg diomongin") ||
+    lower.includes("lagi bahas apa") ||
+    lower.includes("ngomongin apa")
   ) {
     return true;
   }
@@ -452,8 +490,29 @@ export async function handleIncomingGroupMessage(
   groupId: string,
   senderPhone: string,
   senderName: string,
-  messageText: string
+  messageText: string,
+  quotedText?: string,
+  quotedSender?: string,
+  quotedFromBot?: boolean,
+  contacts?: Array<{ displayName: string; phone: string }>
 ): Promise<{ responded: boolean; replyText?: string }> {
+  // 0. CATAT SELURUH OBROLAN GRUP KE ROLLING BUFFER PERCAKAPAN
+  // Menjaga memori percakapan agar bot memiliki konteks ketika ditanya kesimpulan atau topik
+  try {
+    const { recordGroupChatMessage } = await import("@/lib/whatsapp/groupConversationBuffer");
+    await recordGroupChatMessage(groupId, {
+      senderPhone,
+      senderName: senderName || "Sahabat",
+      messageText,
+      quotedText,
+      quotedSender,
+      timestamp: Date.now(),
+      isFromBot: false,
+    });
+  } catch (bufErr) {
+    console.warn("[GROUP-BUFFER-RECORD-WARN]:", bufErr);
+  }
+
   // =========================================================================
   // 1. CABANG KHUSUS: GRUP GRAPHIC DESIGN / STUDIO EDITOR ANGKATAN
   // =========================================================================
@@ -469,6 +528,8 @@ export async function handleIncomingGroupMessage(
       senderName: callerName,
       messageText,
       groupId,
+      quotedText,
+      quotedSender,
     });
 
     const groupSendResult = await sendWhatsAppGroupMessage(groupId, replyText);
@@ -497,8 +558,30 @@ export async function handleIncomingGroupMessage(
   // =========================================================================
   // 2. CABANG REGULER: GRUP KOMUNITAS / ANGKATAN NON-RESMI
   // =========================================================================
+  // A0. DETEKSI OTOMATIS PEMBAGIAN NOMOR TELEPON (Full Automatic Member Inviter)
+  // Menangani nomor polos, share contact, nomor dengan nama, atau balasan atas pertanyaan bot
+  try {
+    const { handleAutomaticGroupNumberDetection } = await import("@/lib/whatsapp/autoMemberInviter");
+    const autoNumberRes = await handleAutomaticGroupNumberDetection({
+      groupId,
+      senderPhone,
+      senderName,
+      messageText,
+      quotedText,
+      quotedSender,
+      isQuotedFromBot: Boolean(quotedFromBot),
+      contacts,
+    });
+
+    if (autoNumberRes.handled) {
+      return { responded: true, replyText: autoNumberRes.replyText };
+    }
+  } catch (numErr: any) {
+    console.warn("[AUTO-NUMBER-DETECTION-WARN]:", numErr.message);
+  }
+
   // Hanya respons jika dipanggil atau merupakan command / pertanyaan seputar angkatan
-  if (!shouldGroupBotRespond(messageText)) {
+  if (!shouldGroupBotRespond(messageText, quotedFromBot)) {
     return { responded: false };
   }
 
@@ -538,10 +621,25 @@ export async function handleIncomingGroupMessage(
     senderName: callerName,
     isGroup: true,
     groupId,
+    quotedText,
+    quotedSender,
+    quotedFromBot,
   });
 
   // Kirim balasan ke grup WhatsApp
   const groupSendResult = await sendWhatsAppGroupMessage(groupId, replyText);
+
+  // Catat balasan bot ke rolling buffer percakapan agar tersambung di pesan berikutnya
+  try {
+    const { recordGroupChatMessage } = await import("@/lib/whatsapp/groupConversationBuffer");
+    await recordGroupChatMessage(groupId, {
+      senderPhone: "bot",
+      senderName: "Bot Expedient 43",
+      messageText: replyText,
+      timestamp: Date.now(),
+      isFromBot: true,
+    });
+  } catch (_) {}
 
   // Catat riwayat grup ke database Supabase
   try {

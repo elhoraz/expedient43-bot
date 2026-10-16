@@ -58,6 +58,8 @@ import {
 import {
   shouldGroupBotRespond,
 } from "../src/lib/whatsapp/groupManager";
+import { handleAutomaticGroupNumberDetection, extractContactsFromBaileysMessage } from "../src/lib/whatsapp/autoMemberInviter";
+import { recordGroupChatMessage } from "../src/lib/whatsapp/groupConversationBuffer";
 import { generateIntelligentCohortReply } from "../src/lib/whatsapp/alumniIntelligence";
 import { handleAdminAutoRemediation } from "../src/lib/sentinel/autoRemediator";
 import {
@@ -86,6 +88,7 @@ import {
   getMonthBirthdaySummary,
   getTodayBirthdayAlumni,
   formatBirthdayGreetingMessage,
+  formatPersonalBirthdayGreetingMessage,
 } from "../src/lib/whatsapp/birthdayCelebrator";
 import {
   startSantriQuiz,
@@ -122,6 +125,90 @@ interface LogEntry {
 }
 
 const activityLogs: LogEntry[] = [];
+const groupFridayCooldown = new Map<string, number>();
+const groupBirthdayCooldown = new Map<string, number>();
+
+// =============================================================================
+// GLOBAL ANTI-LOOP & ANTI-SPAM CIRCUIT BREAKER SYSTEM
+// =============================================================================
+const globalSentMessageIds = new Set<string>();
+
+const AUTO_RESPONDER_PATTERNS = [
+  /terima kasih telah menghubungi/i,
+  /pesan ini dikirim secara otomatis/i,
+  /auto[\s-]?reply/i,
+  /autoreply/i,
+  /kami sedang (offline|tutup|istirahat|tidak di tempat)/i,
+  /out of office/i,
+  /away message/i,
+  /akan segera (membalas|merespons|menghubungi)/i,
+  /terima kasih atas pesan anda/i,
+  /asisten resmi expedient/i,
+  /ref:\s*#eg43-/i,
+  /belum terdaftar di web angkatan kita nih/i,
+  /sudah otomatis ana japri/i,
+  /milik sahabat .* alhamdulillah sudah terdaftar/i,
+];
+
+function isAutoResponderOrBotMessage(text: string): boolean {
+  if (!text) return false;
+  return AUTO_RESPONDER_PATTERNS.some((p) => p.test(text));
+}
+
+// Histori balasan bot per remoteJid untuk burst rate limiting
+const chatReplyTimestamps = new Map<string, number[]>();
+// Cooldown mute per remoteJid saat circuit breaker aktif (timestamp ms)
+const circuitBreakerMutedUntil = new Map<string, number>();
+// Pelacak pengulangan pesan identik dari pengirim
+const lastMessageTrackMap = new Map<string, { text: string; count: number; lastTime: number }>();
+
+function shouldAllowBotReply(remoteJid: string, incomingText: string): { allowed: boolean; reason?: string } {
+  const now = Date.now();
+
+  // 1. Cek Circuit Breaker status (jika sedang dimute karena deteksi loop)
+  const mutedUntil = circuitBreakerMutedUntil.get(remoteJid) || 0;
+  if (now < mutedUntil) {
+    const sRemaining = Math.ceil((mutedUntil - now) / 1000);
+    return { allowed: false, reason: `Circuit breaker aktif (${sRemaining}s tersisa)` };
+  }
+
+  // 2. Cek Deteksi Auto-Responder / Pesan Mesin Otomatis
+  if (isAutoResponderOrBotMessage(incomingText)) {
+    return { allowed: false, reason: "Terdeteksi auto-reply / template bot" };
+  }
+
+  // 3. Cek Repetisi Pesan Identik (User / bot mengirim kalimat yang sama persis berulang-ulang)
+  const cleanNorm = incomingText.trim().toLowerCase();
+  if (cleanNorm.length > 3) {
+    const track = lastMessageTrackMap.get(remoteJid);
+    if (track && track.text === cleanNorm && now - track.lastTime < 45000) {
+      track.count += 1;
+      track.lastTime = now;
+      if (track.count >= 3) {
+        return { allowed: false, reason: `Pesan identik berulang ${track.count}x dalam 45 detik` };
+      }
+    } else {
+      lastMessageTrackMap.set(remoteJid, { text: cleanNorm, count: 1, lastTime: now });
+    }
+  }
+
+  // 4. Cek Frekuensi Burst (Sliding window 60 detik)
+  const timestamps = (chatReplyTimestamps.get(remoteJid) || []).filter((t) => now - t < 60000);
+  if (timestamps.length >= 6) {
+    // PICU CIRCUIT BREAKER: Mute selama 3 menit untuk mengamankan nomor bot dari banned!
+    circuitBreakerMutedUntil.set(remoteJid, now + 3 * 60 * 1000);
+    return { allowed: false, reason: "Burst limit terlampaui (>6 respons dlm 60s). Circuit breaker aktif 3 menit." };
+  }
+
+  return { allowed: true };
+}
+
+function recordBotReplyEvent(remoteJid: string): void {
+  const now = Date.now();
+  const list = (chatReplyTimestamps.get(remoteJid) || []).filter((t) => now - t < 60000);
+  list.push(now);
+  chatReplyTimestamps.set(remoteJid, list);
+}
 
 function addLog(msg: string, level: LogEntry["level"] = "info") {
   const time = new Intl.DateTimeFormat("id-ID", {
@@ -137,15 +224,15 @@ function addLog(msg: string, level: LogEntry["level"] = "info") {
   console.log(`[${time}] ${msg}`);
 }
 
-// Deteksi argumen pairing di CLI
+// Deteksi argumen pairing di CLI (hanya jika diberikan secara eksplisit)
 const pairingArgIndex = process.argv.indexOf("--pairing");
 if (pairingArgIndex !== -1) {
   const nextArg = process.argv[pairingArgIndex + 1];
-  pairingPhoneArg = nextArg && !nextArg.startsWith("-") ? nextArg : "6285151771289";
+  pairingPhoneArg = nextArg && !nextArg.startsWith("-") ? nextArg : "";
 } else {
   const match = process.argv.find((a) => a.startsWith("--pairing="));
   if (match) {
-    pairingPhoneArg = match.split("=")[1] || "6285151771289";
+    pairingPhoneArg = match.split("=")[1] || "";
   } else if (process.env.WA_BOT_PHONE) {
     pairingPhoneArg = process.env.WA_BOT_PHONE;
   }
@@ -276,7 +363,15 @@ async function startBaileysGateway() {
 
   // Otomatis pulihkan sesi dari Supabase Storage jika dijalankan di cloud container
   const credsFile = path.join(AUTH_FOLDER, "creds.json");
-  if (!fs.existsSync(credsFile)) {
+  let hasValidCreds = false;
+  if (fs.existsSync(credsFile)) {
+    try {
+      const parsedCreds = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+      hasValidCreds = Boolean(parsedCreds?.me?.id);
+    } catch (_) {}
+  }
+
+  if (!hasValidCreds) {
     addLog("☁️ Memeriksa cadangan sesi di Supabase Storage...");
     const restored = await restoreSessionFromSupabase(AUTH_FOLDER);
     if (restored) {
@@ -315,6 +410,26 @@ async function startBaileysGateway() {
   });
 
   currentSock = sock;
+
+  // WRAPPER ANTI-LOOP GLOBAL: Intercept 100% pemanggilan sock.sendMessage
+  // Memastikan setiap pesan keluar tercatat di globalSentMessageIds & rate limiter
+  const rawSendMessage = sock.sendMessage.bind(sock);
+  sock.sendMessage = (async (...args: any[]) => {
+    const res = await (rawSendMessage as any)(...args);
+    if (res?.key?.id) {
+      globalSentMessageIds.add(res.key.id);
+      sentMessageIds.add(res.key.id);
+      if (globalSentMessageIds.size > 5000) {
+        const first = globalSentMessageIds.values().next().value;
+        if (first) globalSentMessageIds.delete(first);
+      }
+    }
+    const targetJid = typeof args[0] === "string" ? args[0] : "";
+    if (targetJid && !targetJid.includes("status@broadcast")) {
+      recordBotReplyEvent(targetJid);
+    }
+    return res;
+  }) as any;
 
   // Helper pengiriman pesan yang aman & tahan banting
   const sendReply = async (targetJid: string, text: string, quotedMessage?: any) => {
@@ -941,12 +1056,8 @@ async function startBaileysGateway() {
           }
         } catch (_) {}
 
-        // Hapus cadangan sesi kedaluwarsa di Supabase Storage
-        try {
-          const supabase = createAdminClient();
-          supabase.storage.from("wa-session-backup").remove(["wa_session.gz"]).catch(() => {});
-        } catch (_) {}
-
+        // Catatan: Cadangan di Supabase Storage tetap dipertahankan agar tidak terhapus jika hanya masalah koneksi sementara.
+        
         // Restart Baileys dengan folder kosong agar QR Code baru langsung dipancarkan ke dashboard
         setTimeout(() => startBaileysGateway(), 1500);
         return;
@@ -1031,7 +1142,7 @@ async function startBaileysGateway() {
     for (const m of messages) {
       try {
         const msgId = m.key.id;
-        if (msgId && sentMessageIds.has(msgId)) {
+        if (msgId && (globalSentMessageIds.has(msgId) || sentMessageIds.has(msgId))) {
           continue;
         }
 
@@ -1082,7 +1193,10 @@ async function startBaileysGateway() {
         const rawMsg = m.message;
         const msgContent = (normalizeMessageContent(extractMessageContent(rawMsg) || rawMsg) || {}) as proto.IMessage;
 
-        const messageText =
+        // Ekstraksi kartu kontak WhatsApp asli (contactMessage / contactsArrayMessage / file .vcf)
+        const incomingContacts = extractContactsFromBaileysMessage(msgContent);
+
+        let messageText =
           msgContent.conversation ||
           msgContent.extendedTextMessage?.text ||
           msgContent.imageMessage?.caption ||
@@ -1094,6 +1208,11 @@ async function startBaileysGateway() {
           msgContent.editedMessage?.message?.protocolMessage?.editedMessage?.conversation ||
           msgContent.editedMessage?.message?.protocolMessage?.editedMessage?.extendedTextMessage?.text ||
           "";
+
+        // Jika pesan teks kosong namun ada kartu kontak yang dikirim, buat teks sintetis agar tidak di-skip
+        if (!messageText && incomingContacts.length > 0) {
+          messageText = incomingContacts.map((c) => `[Kontak: ${c.displayName} - ${c.phone}]`).join("\n");
+        }
 
         const lower = messageText.trim().toLowerCase();
 
@@ -1120,10 +1239,35 @@ async function startBaileysGateway() {
           lower === "halo" ||
           lower === "p";
 
-        // Jangan proses pesan yang dikirim bot sendiri KECUALI:
-        // 1. Pesan ke diri sendiri (isSelfChat)
-        // 2. Perintah tes dari pemilik bot (isOwnerCommand)
-        if (m.key.fromMe && !isSelfChat && !isOwnerCommand) {
+        // ATURAN ANTI-LOOP MUTLAK #1:
+        // Cek ID pesan yang pernah dikirim bot sendiri
+        if (msgId && (globalSentMessageIds.has(msgId) || sentMessageIds.has(msgId))) {
+          continue;
+        }
+
+        // ATURAN ANTI-LOOP MUTLAK #2:
+        // Jika pesan dikirim dari akun bot sendiri (fromMe === true atau nomor sender = nomor bot):
+        // HANYA proses jika di ruang "Message Yourself" (isSelfChat) DAN berupa perintah uji eksplisit (isOwnerCommand).
+        // DI LUAR ITU (di grup manapun atau chat dengan orang lain), SELALU ABAIKAN (continue)!
+        const botPhoneList = ["6285151771289", "6289675010185", botPhone].filter(Boolean);
+        const isBotSender =
+          Boolean(m.key.fromMe) ||
+          botPhoneList.some((bp) => senderPhone.includes(bp) || bp.includes(senderPhone)) ||
+          (botShortPhone ? senderPhone.endsWith(botShortPhone) : false) ||
+          (botUserId ? senderPhone.includes(botUserId) : false) ||
+          (botLid ? participantRaw.includes(botLid) : false);
+
+        if (isBotSender) {
+          if (!isSelfChat || !isOwnerCommand) {
+            continue;
+          }
+        }
+
+        // ATURAN ANTI-LOOP MUTLAK #3:
+        // Cek filter Circuit Breaker & Auto-responder untuk mencegah ping-pong loop dengan bot / auto-reply lain
+        const replyCheck = shouldAllowBotReply(remoteJid, messageText);
+        if (!replyCheck.allowed) {
+          addLog(`🛑 [ANTI-LOOP-BLOCKED] ${replyCheck.reason} pada ${remoteJid}`, "warn");
           continue;
         }
 
@@ -1133,7 +1277,9 @@ async function startBaileysGateway() {
           msgContent.audioMessage?.contextInfo ||
           msgContent.videoMessage?.contextInfo ||
           msgContent.stickerMessage?.contextInfo ||
-          msgContent.documentMessage?.contextInfo;
+          msgContent.documentMessage?.contextInfo ||
+          msgContent.contactMessage?.contextInfo ||
+          msgContent.contactsArrayMessage?.contextInfo;
 
         const mentionedJids: string[] = contextInfo?.mentionedJid || [];
         const quotedParticipant = (contextInfo?.participant || "").replace(/\D/g, "");
@@ -1163,6 +1309,8 @@ async function startBaileysGateway() {
           ? ((normalizeMessageContent(extractMessageContent(quotedMsgRaw) || quotedMsgRaw) || {}) as proto.IMessage)
           : null;
 
+        const quotedContacts = quotedMsg ? extractContactsFromBaileysMessage(quotedMsg) : [];
+
         const quotedIsImage = Boolean(quotedMsg?.imageMessage || quotedMsg?.documentMessage?.mimetype?.startsWith("image/"));
         const quotedIsSticker = Boolean(quotedMsg?.stickerMessage);
         const quotedIsAudio = Boolean(quotedMsg?.audioMessage);
@@ -1170,7 +1318,7 @@ async function startBaileysGateway() {
         const quotedIsDocument = Boolean(quotedMsg?.documentMessage && !quotedMsg?.documentMessage?.mimetype?.startsWith("image/"));
         const quotedHasMedia = quotedIsImage || quotedIsSticker || quotedIsAudio || quotedIsVideo || quotedIsDocument;
 
-        const quotedText = (
+        let quotedText = (
           quotedMsg?.conversation ||
           quotedMsg?.extendedTextMessage?.text ||
           quotedMsg?.imageMessage?.caption ||
@@ -1179,14 +1327,19 @@ async function startBaileysGateway() {
           ""
         ).trim();
 
+        if (!quotedText && quotedContacts.length > 0) {
+          quotedText = quotedContacts.map((c) => `[Kontak: ${c.displayName} - ${c.phone}]`).join("\n");
+        }
+
         const isImage = Boolean(msgContent.imageMessage || msgContent.documentMessage?.mimetype?.startsWith("image/"));
         const isSticker = Boolean(msgContent.stickerMessage);
         const isAudio = Boolean(msgContent.audioMessage);
         const isVideo = Boolean(msgContent.videoMessage || msgContent.ptvMessage);
         const isDocument = Boolean(msgContent.documentMessage && !msgContent.documentMessage?.mimetype?.startsWith("image/"));
+        const isContactCard = incomingContacts.length > 0;
         const hasMedia = isImage || isSticker || isAudio || isVideo || isDocument;
 
-        addLog(`📩 [INCOMING] ${senderName} (${senderPhone}) [Grup: ${isGroup}]${quotedText ? ` [Reply: "${quotedText.slice(0, 30)}..."]` : ""}: "${messageText.slice(0, 50)}"`);
+        addLog(`📩 [INCOMING] ${senderName} (${senderPhone}) [Grup: ${isGroup}]${quotedText ? ` [Reply: "${quotedText.slice(0, 30)}..."]` : ""}${isContactCard ? ` [Kontak: ${incomingContacts.map((c) => c.displayName).join(", ")}]` : ""}: "${messageText.slice(0, 50)}"`);
 
         // Rekam aktivitas jika pesan berasal dari grup non-formal / komunitas (120363388633880584@g.us)
         if (isGroup && (remoteJid.includes("120363388633880584") || remoteJid === getCommunityGroupId())) {
@@ -1195,6 +1348,18 @@ async function startBaileysGateway() {
             senderName || "Sahabat",
             senderPhone || ""
           ).catch(() => {});
+        }
+
+        // Rekam riwayat percakapan obrolan grup agar AI selalu memiliki konteks diskusi terkini
+        if (isGroup && messageText) {
+          recordGroupChatMessage(remoteJid, {
+            senderPhone,
+            senderName: senderName || "Sahabat",
+            messageText,
+            quotedText,
+            quotedSender: quotedParticipant,
+            timestamp: Date.now(),
+          }).catch(() => {});
         }
 
         // 1. PENANGANAN MEDIA LANGSUNG
@@ -1224,7 +1389,7 @@ async function startBaileysGateway() {
             : true;
 
           if (shouldRespond) {
-            addLog(`🎨 [MEDIA-PROCESS] Memproses media ${category} dari ${senderName}...`);
+            addLog(`🎨 [MEDIA-PROCESS] Memproses media ${isSticker && msgContent.stickerMessage?.isAnimated ? "stiker bergerak (animasi)" : category} dari ${senderName}...`);
             await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
 
             try {
@@ -1468,18 +1633,51 @@ async function startBaileysGateway() {
         // =====================================================================
         // FITUR MILAD / ULANG TAHUN ALUMNI (HARI INI & BULAN INI)
         // =====================================================================
-        const isBirthdayTrigger =
-          cleanLower.includes("siapa yang ultah") ||
-          cleanLower.includes("siapa yang milad") ||
-          cleanLower.includes("ultah hari ini") ||
-          cleanLower.includes("milad hari ini") ||
-          cleanLower.includes("milad bulan ini") ||
-          cleanLower.includes("ultah bulan ini") ||
-          cleanLower === "!milad" ||
-          cleanLower === "/milad" ||
-          cleanLower === "!ultah";
+        const isCasualBdayChat =
+          cleanLower.includes("selamat ulang tahun") ||
+          cleanLower.includes("selamat milad") ||
+          cleanLower.includes("barakallah") ||
+          cleanLower.includes("mabruk") ||
+          cleanLower.includes("hbd") ||
+          cleanLower.includes("met ultah") ||
+          cleanLower.includes("traktir");
 
-        if (isBirthdayTrigger && (isGroup ? isDirectlyAddressed || shouldGroupBotRespond(messageText) : true)) {
+        const isBirthdayTrigger =
+          !isCasualBdayChat &&
+          (cleanLower === "!milad" ||
+            cleanLower === "/milad" ||
+            cleanLower === "!ultah" ||
+            cleanLower === "/ultah" ||
+            cleanLower.startsWith("siapa yang ultah") ||
+            cleanLower.startsWith("siapa yang milad") ||
+            cleanLower.startsWith("siapa ultah") ||
+            cleanLower.startsWith("siapa milad") ||
+            cleanLower.startsWith("info ultah") ||
+            cleanLower.startsWith("jadwal ultah") ||
+            cleanLower.startsWith("info milad") ||
+            cleanLower.startsWith("jadwal milad") ||
+            (isDirectlyAddressed && (cleanLower.includes("ultah") || cleanLower.includes("milad") || cleanLower.includes("ulang tahun"))));
+
+        if (isBirthdayTrigger && (isGroup ? isDirectlyAddressed || cleanLower.startsWith("!") || cleanLower.startsWith("/") : true)) {
+          const nowMs = Date.now();
+          const lastBdayQuery = groupBirthdayCooldown.get(remoteJid) || 0;
+
+          // Anti-spam group cooldown: maks 1x per 15 menit per grup untuk query milad manual
+          if (isGroup && nowMs - lastBdayQuery < 15 * 60 * 1000) {
+            if (isDirectlyAddressed || cleanLower.startsWith("!") || cleanLower.startsWith("/")) {
+              await sendReply(
+                remoteJid,
+                `🎂 Informasi agenda milad alumni sudah dibagikan di atas sahabat. Mari doakan sahabat kita yang berulang tahun! ✨`,
+                m
+              );
+            }
+            continue;
+          }
+
+          if (isGroup) {
+            groupBirthdayCooldown.set(remoteJid, nowMs);
+          }
+
           addLog(`🎂 [BIRTHDAY-QUERY] Memeriksa agenda milad alumni untuk ${senderName}...`);
           await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
           const todayBirthdays = await getTodayBirthdayAlumni();
@@ -1527,10 +1725,32 @@ async function startBaileysGateway() {
         const isFridayBlessingTrigger =
           cleanLower === "!jumat" ||
           cleanLower === "/jumat" ||
-          cleanLower.includes("sunnah jumat") ||
-          cleanLower.includes("jumat berkah");
+          cleanLower === "!jumatberkah" ||
+          cleanLower === "/jumatberkah" ||
+          cleanLower === "!sunnahjumat" ||
+          cleanLower === "/sunnahjumat" ||
+          ((cleanLower === "jumat berkah" || cleanLower === "sunnah jumat") && isDirectlyAddressed);
 
-        if (isFridayBlessingTrigger && (isGroup ? isDirectlyAddressed || shouldGroupBotRespond(messageText) : true)) {
+        if (isFridayBlessingTrigger && (isGroup ? isDirectlyAddressed || cleanLower.startsWith("!") || cleanLower.startsWith("/") : true)) {
+          const nowMs = Date.now();
+          const lastSentTime = groupFridayCooldown.get(remoteJid) || 0;
+
+          // Anti-spam group cooldown: maks 1x per 30 menit per grup jika manual command
+          if (isGroup && nowMs - lastSentTime < 30 * 60 * 1000) {
+            if (isDirectlyAddressed) {
+              await sendReply(
+                remoteJid,
+                `🌿 Panduan amalan dan mutiara Jum'at Berkah sudah dibagikan di atas sahabat. Mari perbanyak sholawat dan baca Al-Kahfi hari ini! ✨`,
+                m
+              );
+            }
+            continue;
+          }
+
+          if (isGroup) {
+            groupFridayCooldown.set(remoteJid, nowMs);
+          }
+
           await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
           const fridayMsg = formatFridayBlessingMessage();
           await sendReply(remoteJid, fridayMsg, m);
@@ -1714,6 +1934,16 @@ async function startBaileysGateway() {
               addLog(`🖌️ [DESIGN-GROUP] Membalas di Grup Desain...`);
               await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
               try {
+                recordGroupChatMessage(remoteJid, {
+                  senderPhone,
+                  senderName: senderName || "Sahabat Editor",
+                  messageText,
+                  quotedText,
+                  quotedSender: quotedParticipant,
+                  timestamp: Date.now(),
+                  isFromBot: false,
+                }).catch(() => {});
+
                 const replyText = await handleDesignStudioConversation({
                   senderPhone,
                   senderName,
@@ -1722,6 +1952,14 @@ async function startBaileysGateway() {
                   quotedText,
                   quotedSender: quotedParticipant,
                 });
+
+                recordGroupChatMessage(remoteJid, {
+                  senderPhone: "bot",
+                  senderName: "Bot Expedient Studio",
+                  messageText: replyText,
+                  timestamp: Date.now(),
+                  isFromBot: true,
+                }).catch(() => {});
 
                 // INTERCEPT JIKA ACTION TRIGGER POSTER DIBERIKAN OLEH STUDIO ASSISTANT
                 if (replyText.startsWith("[ACTION:GENERATE_POSTER:")) {
@@ -1744,6 +1982,43 @@ async function startBaileysGateway() {
           }
           // CABANG B: GRUP ANGKATAN / KOMUNITAS
           else {
+            // A0. DETEKSI OTOMATIS PEMBAGIAN NOMOR TELEPON & KARTU KONTAK (Full Automatic Member Inviter)
+            try {
+              const autoNumberRes = await handleAutomaticGroupNumberDetection({
+                groupId: remoteJid,
+                senderPhone,
+                senderName,
+                messageText,
+                quotedText,
+                quotedSender: quotedParticipant,
+                isQuotedFromBot: Boolean(isBotQuoted),
+                isPrivateChat: false,
+                contacts: incomingContacts,
+                customSender: async (target: string, msg: string) => {
+                  try {
+                    let cleanTarget = target.trim();
+                    if (!cleanTarget.includes("@")) {
+                      let num = cleanTarget.replace(/\D/g, "");
+                      if (num.startsWith("0")) num = "62" + num.substring(1);
+                      cleanTarget = `${num}@s.whatsapp.net`;
+                    }
+                    const sent = await sock.sendMessage(cleanTarget, { text: msg });
+                    if (sent?.key?.id) sentMessageIds.add(sent.key.id);
+                    return { success: true };
+                  } catch (e: any) {
+                    return { success: false, reason: e.message };
+                  }
+                },
+              });
+
+              if (autoNumberRes.handled) {
+                addLog(`📱 [AUTO-INVITE-GROUP] Berhasil memproses nomor telepon / kontak di grup dari ${senderName}`, "success");
+                continue;
+              }
+            } catch (autoErr: any) {
+              addLog(`⚠️ [AUTO-INVITE-GROUP-ERR] ${autoErr.message}`, "warn");
+            }
+
             if (isDirectlyAddressed || shouldGroupBotRespond(messageText)) {
               addLog(`👥 [COMMUNITY-GROUP] Membalas di Grup Komunitas...`);
               await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
@@ -1819,16 +2094,72 @@ async function startBaileysGateway() {
             }
           }
 
+          // A0. DETEKSI OTOMATIS PEMBAGIAN / PENGUJIAN NOMOR TELEPON & KARTU KONTAK (Chat Pribadi)
           try {
+            const autoNumberRes = await handleAutomaticGroupNumberDetection({
+              groupId: remoteJid,
+              senderPhone,
+              senderName,
+              messageText,
+              quotedText,
+              quotedSender: quotedParticipant,
+              isQuotedFromBot: Boolean(isBotQuoted),
+              isPrivateChat: true,
+              contacts: incomingContacts,
+              customSender: async (target: string, msg: string) => {
+                try {
+                  let cleanTarget = target.trim();
+                  if (!cleanTarget.includes("@")) {
+                    let num = cleanTarget.replace(/\D/g, "");
+                    if (num.startsWith("0")) num = "62" + num.substring(1);
+                    cleanTarget = `${num}@s.whatsapp.net`;
+                  }
+                  const sent = await sock.sendMessage(cleanTarget, { text: msg });
+                  if (sent?.key?.id) sentMessageIds.add(sent.key.id);
+                  return { success: true };
+                } catch (e: any) {
+                  return { success: false, reason: e.message };
+                }
+              },
+            });
+
+            if (autoNumberRes.handled) {
+              addLog(`📱 [AUTO-INVITE-PRIVATE] Berhasil memproses nomor telepon / kontak via chat pribadi dari ${senderName}`, "success");
+              continue;
+            }
+          } catch (autoErr: any) {
+            addLog(`⚠️ [AUTO-INVITE-PRIVATE-ERR] ${autoErr.message}`, "warn");
+          }
+
+          try {
+            recordGroupChatMessage(remoteJid, {
+              senderPhone,
+              senderName: senderName || "Sahabat",
+              messageText,
+              quotedText,
+              quotedSender: quotedParticipant,
+              timestamp: Date.now(),
+              isFromBot: false,
+            }).catch(() => {});
+
             const replyText = await generateIntelligentCohortReply({
               messageText,
               senderPhone,
               senderName,
               isGroup: false,
+              groupId: remoteJid,
               quotedText,
               quotedSender: quotedParticipant,
               quotedFromBot: Boolean(isBotQuoted),
             });
+
+            recordGroupChatMessage(remoteJid, {
+              senderPhone: "bot",
+              senderName: "Bot Expedient 43",
+              messageText: replyText,
+              timestamp: Date.now(),
+              isFromBot: true,
+            }).catch(() => {});
 
             const wantsVoiceReply =
               /\b(suara|vn|voice|ngomong|bicara|audio)\b/i.test(lower) ||
@@ -1962,6 +2293,27 @@ const healthServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // 4bb. API Trigger Birthday Wishes On-Demand
+  if (url === "/api/birthday" || (url.startsWith("/api/birthday") && (req.method === "POST" || req.method === "GET"))) {
+    if (!currentSock || gatewayStatus !== "connected") {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "WhatsApp belum terhubung" }));
+      return;
+    }
+
+    addLog("🎂 [API-BIRTHDAY] Permintaan trigger ucapan milad via HTTP API...", "info");
+    try {
+      const commGroupId = getCommunityGroupId();
+      const result = await checkAndTriggerDailyBirthdayWishes(currentSock, commGroupId, true);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, result }));
+    } catch (err: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
   // 4b. API Kirim Pesan Teks ke Grup/JID tertentu (curl -X POST /api/send-message)
   if (url === "/api/send-message" && req.method === "POST") {
     let body = "";
@@ -1975,7 +2327,7 @@ const healthServer = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ success: false, error: "Unauthorized" }));
           return;
         }
-        const { jid, text } = parsed;
+        const { jid, text, imageUrl, imageBase64, mentions } = parsed;
         if (!jid || !text) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: false, error: "Parameter 'jid' dan 'text' harus diisi" }));
@@ -1986,9 +2338,43 @@ const healthServer = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ success: false, error: "WhatsApp belum terhubung" }));
           return;
         }
-        const cleanJid = jid.includes("@") ? jid : `${jid}@g.us`;
-        const sentRes = await currentSock.sendMessage(cleanJid, { text });
-        addLog(`📤 [API-SEND-MSG] Pesan terkirim ke ${cleanJid}: "${text.slice(0, 50)}"`, "success");
+        const cleanJid = jid.includes("@") 
+          ? jid 
+          : (jid.length > 15 || jid.startsWith("120") ? `${jid}@g.us` : `${jid}@s.whatsapp.net`);
+        let sentRes: any = null;
+
+        // Jika disediakan imageUrl atau imageBase64, kirim sebagai pesan foto dengan caption
+        let imgBuf: Buffer | null = null;
+        if (imageBase64) {
+          try {
+            imgBuf = Buffer.from(imageBase64, "base64");
+          } catch (_) {}
+        } else if (imageUrl && typeof imageUrl === "string" && imageUrl.startsWith("http")) {
+          try {
+            const imgFetch = await fetch(imageUrl, { signal: AbortSignal.timeout(12000) });
+            if (imgFetch.ok) {
+              imgBuf = Buffer.from(await imgFetch.arrayBuffer());
+            }
+          } catch (fetchErr: any) {
+            addLog(`⚠️ [API-SEND-MSG] Gagal mengunduh imageUrl (${fetchErr.message}), mengirim teks biasa`, "warn");
+          }
+        }
+
+        if (imgBuf && imgBuf.length > 500) {
+          sentRes = await currentSock.sendMessage(cleanJid, {
+            image: imgBuf,
+            caption: text,
+            mentions: Array.isArray(mentions) ? mentions : [],
+          });
+          addLog(`📤 [API-SEND-IMG-MSG] Foto profil/gambar + pesan terkirim ke ${cleanJid}: "${text.slice(0, 50)}"`, "success");
+        } else {
+          sentRes = await currentSock.sendMessage(cleanJid, {
+            text,
+            mentions: Array.isArray(mentions) ? mentions : [],
+          });
+          addLog(`📤 [API-SEND-MSG] Pesan teks terkirim ke ${cleanJid}: "${text.slice(0, 50)}"`, "success");
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, messageId: sentRes?.key?.id }));
       } catch (err: any) {
